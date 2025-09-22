@@ -5,39 +5,31 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-SRC_DIR="$ROOT/third_party/fortran"
-OUT_DIR="$ROOT/third_party"
+SRC_DIR="$ROOT/fortran"
 
 cd "$SRC_DIR"
-
+rm -f *.mod *.so
 # Ensure sources exist
-for f in common_da_wloc.f90 common_letkf.f90 common_mtx.f90 common_tools.f90; do
+for f in netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90; do
   if [[ ! -f $f ]]; then
     echo "[ERROR] Missing $f in $SRC_DIR"
     exit 1
   fi
 done
 
-# Compiler & flags
-FC=${FC:-gfortran}
-OMP_FLAG=${OMP_FLAG:-"-fopenmp"}
-PYTHON=${PYTHON:-python}
-F2PY="$PYTHON -m numpy.f2py"
+F2PY=f2py
 MODNAME="cletkf_wloc"
-
-echo "[build] Sources: common_da_wloc.f90 common_letkf.f90 common_mtx.f90 common_tools.f90"
-
-$F2PY -c -m $MODNAME \
-  common_da_wloc.f90 common_letkf.f90 common_mtx.f90 common_tools.f90 \
-  --fcompiler=gnu95 \
-  --opt='-O3' \
-  --f90flags="$OMP_FLAG -O3" \
-  -lgomp
+FFLAGS='-O3'
+#export FC=gfortran
+#export F90=gfortran
+echo "[build] Sources: SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90"
+#$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90 -m cletkf_wloc
+#$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da.f90 -m cletkf > compile_cletkf.out 2>&1
+$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90 -m cletkf_wloc > compile_cletkf_wloc.out 2>&1
 
 SOFILE=$(ls ${MODNAME}*.so | head -n1 || true)
 if [[ -n "${SOFILE}" ]]; then
-  mv -v "${SOFILE}" "$OUT_DIR/"
-  echo "[build] Installed: $OUT_DIR/${SOFILE}"
+  echo "[build] Installed: $SRC_DIR/${SOFILE}"
 else
   echo "[warn] Build finished but .so not found."
 fi

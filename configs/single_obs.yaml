@@ -3,8 +3,8 @@ paths:
   outdir:   /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/runs/single_obs
 
 state:
-  truth_member: 0
-  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4}
+  truth_member: 22
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
 obs:
   kind: SINGLE
@@ -13,7 +13,7 @@ obs:
 
 da:
   use_fortran_letkf: true
-  ntemp: [3]
+  ntemp: [1]
   alpha: [2]
   loc_scales: [5,5,5]
 

@@ -1,6 +1,15 @@
+import sys, pathlib
+# Add repo root to sys.path
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import argparse, yaml, numpy as np
 from da.fortran_interpreter import tempered_wloc
-from obs.reflectivity import calc_reflectivity
+
+from cletkf_wloc      import common_da        as cda
+calc_reflectivity = cda.calc_ref
+
 from obs import selectors as sel
 
 # simple saver
@@ -25,21 +34,6 @@ def tempering_steps(ntemp: int, alpha: float) -> np.ndarray:
     steps = (1.0 / steps) / (1.0 / steps).sum()
     return steps.astype("float32")
 
-def _build_hxf_for_points(grid, ox, oy, oz, var_idx):
-    """grid: [nx,1,nz,Ne,nvar] -> hxf [Nobs, Ne]"""
-    Ne = grid.shape[3]
-    Nobs = len(ox)
-    hxf = np.zeros((Nobs, Ne), dtype="float32")
-    for i in range(Nobs):
-        xi, yi, zi = int(ox[i]), int(oy[i]), int(oz[i])
-        for j in range(Ne):
-            qr = grid[xi, yi, zi, j, var_idx["qr"]]
-            qs = grid[xi, yi, zi, j, var_idx["qs"]]
-            qg = grid[xi, yi, zi, j, var_idx["qg"]]
-            tt = grid[xi, yi, zi, j, var_idx["T"]]
-            pp = grid[xi, yi, zi, j, var_idx["P"]]
-            hxf[i, j] = calc_reflectivity(qr, qs, qg, tt, pp)
-    return hxf
 
 def _truth_to_yo(truth, ox, oy, oz, var_idx):
     yo = np.zeros(len(ox), dtype="float32")
@@ -108,13 +102,10 @@ def main():
     all_cycle = []
     cycles = int(da_cfg.get("cycles", 1))
 
-    for cyc in range(cycles):
-        print(f"[cycle] {cyc+1}/{cycles}: build Hx_f …")
-        hxf = _build_hxf_for_points(Xf_grid, ox_arr, oy_arr, oz_arr, st["var_idx"])
-
+    for cyc in range(cycles): 
         print(f"[cycle] {cyc+1}/{cycles}: LETKF (Fortran) …")
-        xatemp, deps = tempered_wloc(
-            xf_grid=Xf_grid, hxf=hxf, yo=yo,
+        xatemp, deps = tempered_wloc(st=st,
+            xf_grid=Xf_grid yo=yo,
             obs_error=obs_error, loc_scales=loc_scales,
             ox=ox_arr, oy=oy_arr, oz=oz_arr,
             steps=steps

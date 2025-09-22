@@ -1,6 +1,14 @@
+import sys, pathlib
+# Add repo root to sys.path
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import argparse, yaml, numpy as np
 from da.fortran_interpreter import tempered_wloc
-from obs.reflectivity import calc_reflectivity
+#from obs.reflectivity import calc_reflectivity
+from cletkf_wloc      import common_da        as cda
+calc_reflectivity = cda.calc_ref
 
 # simple saver
 import os, json
@@ -50,17 +58,9 @@ def main():
     qs = truth[ox, oy, oz, st["var_idx"]["qs"]]
     tt = truth[ox, oy, oz, st["var_idx"]["T"]]
     pp = truth[ox, oy, oz, st["var_idx"]["P"]]
-    yo = np.array([calc_reflectivity(qr, qs, qg, tt, pp)], dtype="float32")
+    yo = np.array([calc_reflectivity(qr, qs, qg, tt, pp)])#, dtype="float32")
 
     # forecasted obs Hx_f for all members
-    hxf = np.zeros((1, Ne), dtype="float32")
-    for j in range(Ne):
-        qr = xf[ox, oy, oz, j, st["var_idx"]["qr"]]
-        qs = xf[ox, oy, oz, j, st["var_idx"]["qs"]]
-        qg = xf[ox, oy, oz, j, st["var_idx"]["qg"]]
-        tt = xf[ox, oy, oz, j, st["var_idx"]["T"]]
-        pp = xf[ox, oy, oz, j, st["var_idx"]["P"]]
-        hxf[0, j] = calc_reflectivity(qr, qs, qg, tt, pp)
 
     # LETKF (Fortran)
     steps = tempering_steps(da_cfg["ntemp"][0], da_cfg["alpha"][0])
@@ -70,9 +70,9 @@ def main():
     oy_arr = np.array([oy], dtype="int32")
     oz_arr = np.array([oz], dtype="int32")
 
-    xatemp, deps = tempered_wloc(
+    xatemp, deps = tempered_wloc(st=st,
         xf_grid=xf.astype("float32"),
-        hxf=hxf, yo=yo, obs_error=obs_error,
+        yo=yo, obs_error=obs_error,
         loc_scales=loc_scales, ox=ox_arr, oy=oy_arr, oz=oz_arr,
         steps=steps
     )
@@ -80,9 +80,9 @@ def main():
 
     # save
     meta = dict(config=cfg)
-    outtag = f"single_obs__nt={da_cfg['ntemp'][0]}__a={da_cfg['alpha'][0]}"
+    outtag = f"single_obs_ntemp{da_cfg['ntemp'][0]}_alpha{da_cfg['alpha'][0]}"
     _save_run(paths["outdir"], outtag,
-              xa=Xa, xf=xf, yo=yo, hxf=hxf, deps=deps, steps=steps,
+              xa=Xa,xatemp=xatemp, xf=xf, yo=yo, deps=deps, steps=steps,
               obs_loc=(ox, oy, oz), truth=truth, meta=meta)
 
 if __name__ == "__main__":
