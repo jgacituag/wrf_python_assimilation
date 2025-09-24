@@ -28,14 +28,14 @@ import argparse
 import yaml
 import numpy as np
 from tqdm import tqdm
-
+import pandas as pd
 from netCDF4 import Dataset
 import wrf
 
 def _expand_members(mem_ini: int, mem_end: int, pad: int):
     return [str(i).zfill(pad) for i in range(mem_ini, mem_end + 1)]
 
-def _resolve_paths(cfg):
+def _resolve_paths(cfg,date):
     p = cfg["cross_sections_job"]["paths"]
     ens = cfg["cross_sections_job"]["ensemble"]
     pattern = p.get("pattern") or p.get("template")
@@ -44,10 +44,10 @@ def _resolve_paths(cfg):
 
     members = _expand_members(ens["mem_ini"], ens["mem_end"], ens.get("pad", 0))
     if "{member}" in pattern:
-        nc_paths = [pattern.format(member=m) for m in members]
+        nc_paths = [pattern.format(member=m,date=date) for m in members]
     else:
         nc_paths = [pattern for _ in members]
-    out_path = p["output"]
+    out_path = p["output"].format(date=date)
     return members, nc_paths, out_path
 
 def _get_vars(nc, timeidx):
@@ -81,8 +81,8 @@ def _vert_xsection(da, z, start_latlon, end_latlon, nc):
     ep = wrf.CoordPair(lat=float(end_latlon[0]),   lon=float(end_latlon[1]))
     cs = wrf.vertcross(da, z,
                        start_point=sp, end_point=ep,
-                       wrfin=nc, latlon=True, meta=True)#,
-                       #autolevels=da.shape[0])
+                       wrfin=nc, latlon=True, meta=True,
+                       autolevels=da.shape[0])
     #return np.asarray(cs)  # (nz, nx)
     return wrf.to_np(cs)  # (nz, nx)
 def main():
@@ -93,58 +93,69 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    job = cfg["cross_sections_job"]
-    members, nc_paths, out_path = _resolve_paths(cfg)
+    date_ini = cfg["cross_sections_job"]["paths"].get("init_date")
+    date_end = cfg["cross_sections_job"]["paths"].get("end_date")
+    freq     = cfg["cross_sections_job"]["paths"].get("freq", "1H")
+    if date_ini is not None and date_end is not None:
 
-    cs_cfg = job["cross_section"]
-    start = cs_cfg["start"]
-    end   = cs_cfg["end"]
-    timeidx = cs_cfg.get("timeidx", -1)
+        dates = pd.date_range(start=pd.to_datetime(date_ini,format="%Y-%m-%d_%H:%M:%S"), end=pd.to_datetime(date_end,format="%Y-%m-%d_%H:%M:%S"), freq=freq)
+        print(f"[info] generating cross-sections for {len(dates)} dates from {date_ini} to {date_end} every {freq}")
+        for date in dates:
+            date = date.strftime("%Y-%m-%d_%H:%M:%S")
+            print(f"[info] processing date: {date}")
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            job = cfg["cross_sections_job"]
+            members, nc_paths, out_path = _resolve_paths(cfg,date)
 
-    # Probe shapes from first member
-    with Dataset(nc_paths[0]) as nc0:
-        v0 = _get_vars(nc0, timeidx)
-        samp = _vert_xsection(v0["tk"], v0["z"], start, end, nc0)  # (nz, nx)
-        nz, nx = samp.shape
+            cs_cfg = job["cross_section"]
+            start = cs_cfg["start"]
+            end   = cs_cfg["end"]
+            timeidx = cs_cfg.get("timeidx", -1)
 
-    # var order (nvar = 8):
-    #   0: QGRAUP, 1: QRAIN, 2: QSNOW, 3: T(K), 4: P(hPa), 5: UA, 6: VA, 7: WA
-    nvar = 8
-    Ne   = len(nc_paths)
-    out = np.zeros((nx, 1, nz, Ne, nvar))#, dtype=np.float32, order="F")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    print(f"[info] cross-section dims: nx={nx}, nz={nz}, Ne={Ne}, nvar={nvar}")
-    print("[info] variable order: [QGRAUP, QRAIN, QSNOW, T, P, UA, VA, WA]")
+            # Probe shapes from first member
+            with Dataset(nc_paths[0]) as nc0:
+                v0 = _get_vars(nc0, timeidx)
+                samp = _vert_xsection(v0["tk"], v0["z"], start, end, nc0)  # (nz, nx)
+                nz, nx = samp.shape
 
-    for j, path in enumerate(tqdm(nc_paths, desc="members")):
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing WRF file for member {members[j]}: {path}")
-        with Dataset(path) as nc:
-            v = _get_vars(nc, timeidx)
+            # var order (nvar = 8):
+            #   0: QGRAUP, 1: QRAIN, 2: QSNOW, 3: T(K), 4: P(hPa), 5: UA, 6: VA, 7: WA
+            nvar = 8
+            Ne   = len(nc_paths)
+            out = np.zeros((nx, 1, nz, Ne, nvar))#, dtype=np.float32, order="F")
 
-            xs_qg = _vert_xsection(v["QGRAUP"],  v["z"], start, end, nc)
-            xs_qr = _vert_xsection(v["QRAIN"],   v["z"], start, end, nc)
-            xs_qs = _vert_xsection(v["QSNOW"],   v["z"], start, end, nc)
-            xs_tk = _vert_xsection(v["tk"],      v["z"], start, end, nc)
-            xs_p  = _vert_xsection(v["pressure"],v["z"], start, end, nc)
-            xs_ua = _vert_xsection(v["ua"],      v["z"], start, end, nc)
-            xs_va = _vert_xsection(v["va"],      v["z"], start, end, nc)
-            xs_wa = _vert_xsection(v["wa"],      v["z"], start, end, nc)
+            print(f"[info] cross-section dims: nx={nx}, nz={nz}, Ne={Ne}, nvar={nvar}")
+            print("[info] variable order: [QGRAUP, QRAIN, QSNOW, T, P, UA, VA, WA]")
 
-            # transpose to [nx, nz] and assign
-            out[:, 0, :, j, 0] = xs_qg.T
-            out[:, 0, :, j, 1] = xs_qr.T
-            out[:, 0, :, j, 2] = xs_qs.T
-            out[:, 0, :, j, 3] = xs_tk.T
-            out[:, 0, :, j, 4] = xs_p.T
-            out[:, 0, :, j, 5] = xs_ua.T
-            out[:, 0, :, j, 6] = xs_va.T
-            out[:, 0, :, j, 7] = xs_wa.T
+            for j, path in enumerate(tqdm(nc_paths, desc="members")):
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Missing WRF file for member {members[j]}: {path}")
+                with Dataset(path) as nc:
+                    v = _get_vars(nc, timeidx)
 
-    np.savez_compressed(out_path, cross_sections=out)
-    print(f"[done] wrote: {out_path}")
+                    xs_qg = _vert_xsection(v["QGRAUP"],  v["z"], start, end, nc)
+                    xs_qr = _vert_xsection(v["QRAIN"],   v["z"], start, end, nc)
+                    xs_qs = _vert_xsection(v["QSNOW"],   v["z"], start, end, nc)
+                    xs_tk = _vert_xsection(v["tk"],      v["z"], start, end, nc)
+                    xs_p  = _vert_xsection(v["pressure"],v["z"], start, end, nc)
+                    xs_ua = _vert_xsection(v["ua"],      v["z"], start, end, nc)
+                    xs_va = _vert_xsection(v["va"],      v["z"], start, end, nc)
+                    xs_wa = _vert_xsection(v["wa"],      v["z"], start, end, nc)
+
+                    # transpose to [nx, nz] and assign
+                    out[:, 0, :, j, 0] = xs_qg.T
+                    out[:, 0, :, j, 1] = xs_qr.T
+                    out[:, 0, :, j, 2] = xs_qs.T
+                    out[:, 0, :, j, 3] = xs_tk.T
+                    out[:, 0, :, j, 4] = xs_p.T
+                    out[:, 0, :, j, 5] = xs_ua.T
+                    out[:, 0, :, j, 6] = xs_va.T
+                    out[:, 0, :, j, 7] = xs_wa.T
+
+            np.savez_compressed(out_path, cross_sections=out)
+            print(f"[done] wrote: {out_path}")
 
 if __name__ == "__main__":
     main()

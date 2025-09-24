@@ -6,15 +6,16 @@ if str(REPO_ROOT) not in sys.path:
 
 import argparse, yaml, numpy as np
 from da.fortran_interpreter import tempered_wloc
+import pandas as pd
+import os, json
+from datetime import datetime
 
 from cletkf_wloc      import common_da        as cda
 calc_reflectivity = cda.calc_ref
-
-from obs import selectors as sel
+import obs.selectors as sel
 
 # simple saver
-import os, json
-from datetime import datetime
+
 def _save_run(outdir: str, tag: str, **arrays_and_meta):
     os.makedirs(outdir, exist_ok=True)
     meta = arrays_and_meta.pop("meta", {})
@@ -35,17 +36,50 @@ def tempering_steps(ntemp: int, alpha: float) -> np.ndarray:
     return steps.astype("float32")
 
 
-def _truth_to_yo(truth, ox, oy, oz, var_idx):
-    yo = np.zeros(len(ox), dtype="float32")
-    for i in range(len(ox)):
-        xi, yi, zi = int(ox[i]), int(oy[i]), int(oz[i])
-        qr = truth[xi, yi, zi, var_idx["qr"]]
-        qs = truth[xi, yi, zi, var_idx["qs"]]
-        qg = truth[xi, yi, zi, var_idx["qg"]]
-        tt = truth[xi, yi, zi, var_idx["T"]]
-        pp = truth[xi, yi, zi, var_idx["P"]]
-        yo[i] = calc_reflectivity(qr, qs, qg, tt, pp)
-    return yo
+def _truth_to_yo(truth,xf, ox, oy, oz, var_idx):
+    print(f"[info] building yo from truth at {len(ox)*len(oy)*len(oz)} obs locations")
+    yo = []
+    x0 = []
+    y0 = []
+    z0 = []
+
+    for xi in ox:
+        for yi in oy:
+            for zi in oz:
+                qr = truth[xi, yi, zi, var_idx["qr"]]
+                qs = truth[xi, yi, zi, var_idx["qs"]]
+                qg = truth[xi, yi, zi, var_idx["qg"]]
+                tt = truth[xi, yi, zi, var_idx["T"]]
+                pp = truth[xi, yi, zi, var_idx["P"]]
+
+                qr_f = np.mean(xf[xi, yi, zi, :, var_idx["qr"]])
+                qs_f = np.mean(xf[xi, yi, zi, :, var_idx["qs"]])
+                qg_f = np.mean(xf[xi, yi, zi, :, var_idx["qg"]])
+                tt_f = np.mean(xf[xi, yi, zi, :, var_idx["T"]])
+                pp_f = np.mean(xf[xi, yi, zi, :, var_idx["P"]])
+
+                yf = calc_reflectivity(qr_f, qs_f, qg_f, tt_f, pp_f)
+                yt = calc_reflectivity(qr, qs, qg, tt, pp)
+                if yf < 5:
+                    yf = 0.0
+                if yt < 5:
+                    yt = 0.0
+                if np.isnan(yf) or np.isnan(yt):
+                    continue
+                elif yt<0.1 and yf<0.1:
+                    continue
+                else:
+                    yo.append(yt)
+                    x0.append(xi)
+                    y0.append(yi)
+                    z0.append(zi)
+
+    yo = np.array(yo, dtype="float32")
+    x0 = np.array(x0, dtype="int32")
+    y0 = np.array(y0, dtype="int32")
+    z0 = np.array(z0, dtype="int32")
+    print(f"[info] built yo with {len(yo)} valid obs")
+    return yo, x0, y0, z0
 
 def _select_obs(obs_cfg, nx, nz):
     kind = obs_cfg.get("kind", "FULL_2D").upper()
@@ -76,58 +110,60 @@ def main():
 
     paths = cfg["paths"]; st = cfg["state"]; obs_cfg = cfg["obs"]; da_cfg = cfg["da"]
 
-    data = np.load(paths["prepared"])["cross_sections"]  # [nx,1,nz,nbv,nvar]
-    truth_member = st["truth_member"]
-    mask = np.zeros(data.shape[3], dtype=bool); mask[truth_member] = True
-    truth = data[:, :, :, mask, :][:, :, :, 0, :]        # [nx,1,nz,nvar]
-    xf = data[:, :, :, ~mask, :]                         # [nx,1,nz,Ne,nvar]
-    nx, ny, nz, Ne, nvar = xf.shape
+    date_ini = da_cfg.get("init_date")
+    date_end = da_cfg.get("end_date")
+    freq     = da_cfg.get("freq")
+    dates = pd.date_range(start=pd.to_datetime(date_ini,format="%Y-%m-%d_%H:%M:%S"), end=pd.to_datetime(date_end,format="%Y-%m-%d_%H:%M:%S"), freq=freq)
+    print(f"[info] running data assimilation for {len(dates)} dates from {date_ini} to {date_end} every {freq}")
+    for date in dates:
+        date = date.strftime("%Y-%m-%d_%H:%M:%S")
+        print(f"[info] processing date: {date}")
+        prepared_file = paths["prepared"].format(date=date)
 
-    # --- select observation points ---
-    (ox, oy, oz), kind_tag = _select_obs(obs_cfg, nx, nz)
-    if len(ox) == 0:
-        raise RuntimeError("No observation points selected — check obs config.")
-    print(f"[obs] kind={kind_tag}, Nobs={len(ox)}")
+        data = np.load(prepared_file)["cross_sections"]  # [nx,1,nz,nbv,nvar]
+        truth_member = st["truth_member"]
+        mask = np.zeros(data.shape[3], dtype=bool); mask[truth_member] = True
+        truth = data[:, :, :, mask, :][:, :, :, 0, :]        # [nx,1,nz,nvar]
+        xf = data[:, :, :, ~mask, :]                         # [nx,1,nz,Ne,nvar]
+        nx, ny, nz, Ne, nvar = xf.shape
 
-    # Build y^o from truth and set obs error
-    yo = _truth_to_yo(truth, ox, oy, oz, st["var_idx"])
-    obs_error = (obs_cfg.get("sigma_dbz", 1.0) * np.ones_like(yo)).astype("float32")
+        # --- select observation points ---
+        #(ox, oy, oz), kind_tag = _select_obs(obs_cfg, nx, nz)
+        ox = np.arange(0, nx, 1)
+        oy = np.arange(0, ny, 1)
+        oz = np.arange(0, nz, 1)
+        kind_tag = "FULL_2D"
+        if len(ox) == 0:
+            raise RuntimeError("No observation points selected — check obs config.")
+        print(f"[obs] kind={kind_tag}, Nobs={len(ox)}")
 
-    # Tempering & localization
-    steps = tempering_steps(da_cfg["ntemp"][0], da_cfg["alpha"][0])
-    loc_scales = np.array(da_cfg.get("loc_scales", [5,5,5]), dtype="float32")
-    ox_arr, oy_arr, oz_arr = ox.astype("int32"), oy.astype("int32"), oz.astype("int32")
+        # Build y^o from truth and set obs error
+        yo,ox_arr,oy_arr,oz_arr = _truth_to_yo(truth, xf, ox, oy, oz, st["var_idx"])
+        obs_error = (obs_cfg.get("sigma_dbz", 1.0) * np.ones_like(yo)).astype("float32")
 
-    Xf_grid = xf.astype("float32")
-    all_cycle = []
-    cycles = int(da_cfg.get("cycles", 1))
+        # Tempering & localization
+        steps = tempering_steps(da_cfg["ntemp"][0], da_cfg["alpha"][0])
+        loc_scales = np.array(da_cfg.get("loc_scales", [5,5,5]), dtype="float32")
 
-    for cyc in range(cycles): 
-        print(f"[cycle] {cyc+1}/{cycles}: LETKF (Fortran) …")
+        Xf_grid = xf.astype("float32")
+        print(f"[info] running tempered WLOC with {len(steps)} steps, loc_scales={loc_scales.tolist()}")
         xatemp, deps = tempered_wloc(st=st,
-            xf_grid=Xf_grid yo=yo,
+            xf_grid=Xf_grid, yo=yo,
             obs_error=obs_error, loc_scales=loc_scales,
             ox=ox_arr, oy=oy_arr, oz=oz_arr,
             steps=steps
         )
-        Xa_grid = xatemp[..., -1]
-        all_cycle.append(dict(Xa=Xa_grid, deps=deps, steps=steps))
+        Xa = xatemp[..., -1]
 
-        # Identity model between cycles (plug in WRF step here later if desired)
-        Xf_grid = Xa_grid
-
-    Xa = all_cycle[-1]["Xa"]
-    hxf_last = hxf  # from last cycle
-
-    # save
-    meta = dict(config=cfg)
-    tag = cfg.get("experiment_tag", "full2d_multicycle_v1")
-    outtag = f"{tag}__cyc={cycles}__nt={da_cfg['ntemp'][0]}__a={da_cfg['alpha'][0]}__kind={kind_tag}"
-    _save_run(paths["outdir"], outtag,
-              xa=Xa, xf=xf, yo=yo, hxf=hxf_last,
-              deps=all_cycle[-1]["deps"], steps=all_cycle[-1]["steps"],
-              obs_loc=(ox.tolist(), oy.tolist(), oz.tolist()),
-              truth=truth, meta=meta)
+        # save
+        meta = dict(config=cfg)
+        tag = cfg.get("experiment_tag", "full2d_multicycle_v1")
+        outtag = f"{tag}_{date}_temp{da_cfg['ntemp'][0]}_alpha{da_cfg['alpha'][0]}_kind{kind_tag}"
+        _save_run(paths["outdir"], outtag,
+                xa=Xa, xf=xf, yo=yo,
+                deps=deps, steps=steps,
+                ox=ox_arr, oy=oy_arr, oz=oz_arr,
+                truth=truth, meta=meta)
 
 if __name__ == "__main__":
     main()

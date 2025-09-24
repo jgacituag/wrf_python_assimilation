@@ -24,7 +24,7 @@ def tempered_wloc(st,xf_grid, yo, obs_error, loc_scales, ox, oy, oz, steps):
     ntemp = len(steps)
 
     xf_grid = np.asfortranarray(xf_grid.astype("float32"))
-    yo      = np.asarray(yo)#, dtype="float32")
+    yo      = np.asarray(yo, dtype="float32")
     obs_error = np.asarray(obs_error, dtype="float32")
     obs_error = obs_error * np.ones( nobs )
     loc_scales = np.asarray(loc_scales, dtype="float32")
@@ -38,21 +38,21 @@ def tempered_wloc(st,xf_grid, yo, obs_error, loc_scales, ox, oy, oz, steps):
     xatemp = np.zeros((nx,ny,nz,Ne,nvar, ntemp+1), dtype="float32", order="F")
     xatemp[..., 0] = xf_grid
     deps = np.zeros((ntemp, nobs), dtype="float32")
-
+    hxf = np.zeros((nobs, Ne), dtype=np.float32, order="F")
     for it in range(ntemp):
-        hxf = np.zeros((nobs, Ne), dtype="float32")
-        for ii in range( nobs ) :
-            for jj in range(Ne):
-                qr = xatemp[ox, oy, oz, jj, st["var_idx"]["qr"],it]
-                qs = xatemp[ox, oy, oz, jj, st["var_idx"]["qs"],it]
-                qg = xatemp[ox, oy, oz, jj, st["var_idx"]["qg"],it]
-                tt = xatemp[ox, oy, oz, jj, st["var_idx"]["T"] ,it]
-                pp = xatemp[ox, oy, oz, jj, st["var_idx"]["P"] ,it]
-                hxf[ii, jj] = cda.calc_ref(qr, qs, qg, tt, pp)
+        print(f"[info] Tempering step {it+1}/{ntemp}, alpha={steps[it]:.3f}")
+        for jj in range(Ne):
+            qr = xatemp[ox, oy, oz, jj, st["var_idx"]["qr"],it]
+            qs = xatemp[ox, oy, oz, jj, st["var_idx"]["qs"],it]
+            qg = xatemp[ox, oy, oz, jj, st["var_idx"]["qg"],it]
+            tt = xatemp[ox, oy, oz, jj, st["var_idx"]["T"] ,it]
+            pp = xatemp[ox, oy, oz, jj, st["var_idx"]["P"] ,it]
+            hxf[:, jj] = cda.calc_ref(qr, qs, qg, tt, pp)
+
         dep = yo - hxf.mean(axis=1).astype("float32")
         deps[it, :] = dep
         oerr_temp = obs_error * (1.0 / steps[it])
-
+        print('starting LETKF...')
         Xa = cda.simple_letkf_wloc(
             nx=nx, ny=ny, nz=nz,
             nbv=Ne, nvar=nvar, nobs=nobs,
@@ -61,6 +61,6 @@ def tempered_wloc(st,xf_grid, yo, obs_error, loc_scales, ox, oy, oz, steps):
             locs=loc_scales, oerr=oerr_temp
         ).astype("float32")
 
-        xatemp[..., it+1] = Xa.copy()
+        xatemp[..., it+1] = Xa
 
     return xatemp, deps

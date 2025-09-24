@@ -1,0 +1,24 @@
+paths:
+  prepared: /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/cross_sections/ensemble_cross_sections_{date}.npz
+  outdir:   /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/runs/full2d_multicycle
+
+state:
+  truth_member: 22
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
+
+obs:
+  kind: FULL_2D
+  sigma_dbz: 5.0
+
+da:
+  use_fortran_letkf: true
+  init_date: 2023-12-16_19:00:00
+  end_date:  2023-12-16_19:00:00
+  freq: 1H
+  ntemp: [3]
+  alpha: [2]
+  loc_scales: [5,5,5] # in x,y,z axis
+
+experiment_tag: Multicycle_v1
+
+
