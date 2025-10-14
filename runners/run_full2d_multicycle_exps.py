@@ -121,61 +121,79 @@ def main():
         cfg = yaml.safe_load(f)
 
     paths = cfg["paths"]; st = cfg["state"]; obs_cfg = cfg["obs"]; da_cfg = cfg["da"]
+    temps = da_cfg.get("ntemps")
+    alphas = da_cfg.get("alphas")
+    loc_scales_files = da_cfg.get("loc_scale")
     sigma_dbz = obs_cfg.get("sigma_dbz", 5.0)
     date_ini = da_cfg.get("init_date")
     date_end = da_cfg.get("end_date")
     freq     = da_cfg.get("freq")
+    members = [20]#np.arange(30)
     dates = pd.date_range(start=pd.to_datetime(date_ini,format="%Y-%m-%d_%H:%M:%S"), end=pd.to_datetime(date_end,format="%Y-%m-%d_%H:%M:%S"), freq=freq)
     print(f"[info] running data assimilation for {len(dates)} dates from {date_ini} to {date_end} every {freq}")
     for date in dates:
         date = date.strftime("%Y-%m-%d_%H:%M:%S")
         print(f"[info] processing date: {date}")
-        prepared_file = paths["prepared"].format(date=date)
+        for temp in temps:
+            for alpha in alphas:
+                for loc_scale in loc_scales_files:
+                    for truth_member in members:
+                        print(f"[info] running with truth member {truth_member}, temp {temp}, alpha {alpha}, loc_scale {loc_scale}")
 
-        data = np.load(prepared_file)["cross_sections"]  # [nx,1,nz,nbv,nvar]
-        truth_member = st["truth_member"]
-        mask = np.zeros(data.shape[3], dtype=bool); mask[truth_member] = True
-        truth = data[:, :, :, mask, :][:, :, :, 0, :]        # [nx,1,nz,nvar]
-        xf = data[:, :, :, ~mask, :]                         # [nx,1,nz,Ne,nvar]
-        nx, ny, nz, Ne, nvar = xf.shape
-        
-        # --- select observation points ---
-        #(ox, oy, oz), kind_tag = _select_obs(obs_cfg, nx, nz)
-        ox = np.arange(0, nx, 1)
-        oy = np.arange(0, ny, 1)
-        oz = np.arange(0, nz, 1) 
-        # Build y^o from truth and set obs error
-        #yo,ox_arr,oy_arr,oz_arr = _truth_to_yo(truth, xf, ox, oy, oz, st["var_idx"])
-        yo, ox_arr, oy_arr, oz_arr = build_and_qc_dbz_obs(truth=truth, xf=xf, ox_in=ox[::2], oy_in=oy[::2], oz_in=oz[::2],var_idx=st["var_idx"],sigma_dbz=sigma_dbz, dbz_min=5.0, dbz_max=70.0,detect_prob_min=0.20, use_gross_check=True, k_sigma=5.0)
-        kind_tag = "FULL_2D"
-        if len(ox_arr) == 0:
-            raise RuntimeError("No observation points selected — check obs config.")
-        print(f"[obs] kind={kind_tag}, Nobs={len(ox_arr)}")
-        obs_error = (obs_cfg.get("sigma_dbz", 1.0) * np.ones_like(yo)).astype("float32")
+                        steps = tempering_steps(temp, alpha)
+                        loc_scales = np.array( [loc_scale, loc_scale, loc_scale], dtype="float32")
 
-        # Tempering & localization
-        steps = tempering_steps(da_cfg["ntemp"][0], da_cfg["alpha"][0])
-        loc_scales = np.array(da_cfg.get("loc_scales", [5,5,5]), dtype="float32")
 
-        Xf_grid = xf.astype("float32")
-        print(f"[info] running tempered WLOC with {len(steps)} steps, loc_scales={loc_scales.tolist()}")
-        xatemp, deps, hxf = tempered_wloc(st=st,
-            xf_grid=Xf_grid, yo=yo,
-            obs_error=obs_error, loc_scales=loc_scales,
-            ox=ox_arr, oy=oy_arr, oz=oz_arr,
-            steps=steps
-        )
-        Xa = xatemp[..., -1]
+                        prepared_file = paths["prepared"].format(date=date)
 
-        # save
-        meta = dict(config=cfg)
-        tag = cfg.get("experiment_tag", "full2d_multicycle_v1")
-        outtag = f"{tag}_{date}_temp{da_cfg['ntemp'][0]}_alpha{da_cfg['alpha'][0]}_kind{kind_tag}"
-        _save_run(paths["outdir"], outtag,
-                xa=Xa, xf=xf, hxf=hxf,yo=yo,
-                deps=deps, steps=steps,obs_error=obs_error,
-                ox=ox_arr, oy=oy_arr, oz=oz_arr,
-                truth=truth, meta=meta)
+                        data = np.load(prepared_file)["cross_sections"]  # [nx,1,nz,nbv,nvar]
+                        mask = np.zeros(data.shape[3], dtype=bool); mask[truth_member] = True
+                        truth = data[:, :, :, mask, :][:, :, :, 0, :]        # [nx,1,nz,nvar]
+                        xf = data[:, :, :, ~mask, :]                         # [nx,1,nz,Ne,nvar]
+                        nx, ny, nz, Ne, nvar = xf.shape
+                        
+                        ox = np.arange(0, nx, 2)
+                        oy = np.arange(0, ny, 2)
+                        oz = np.arange(0, nz, 2) 
+                        # Build y^o from truth and set obs error
+
+                        yo, ox_arr, oy_arr, oz_arr = build_and_qc_dbz_obs(truth=truth, xf=xf, ox_in=ox, oy_in=oy, oz_in=oz,var_idx=st["var_idx"],sigma_dbz=sigma_dbz, dbz_min=5.0, dbz_max=70.0,detect_prob_min=0.20, use_gross_check=True, k_sigma=5.0)
+
+                        print(f"\n[DIAGNOSTIC] Observation Density Check:")
+                        print(f"Grid size: {nx} × {ny} × {nz}")
+                        print(f"Total observations: {len(ox_arr)}")
+                        print(f"Obs density: {len(ox_arr)/(nx*ny*nz)*100:.1f}% of grid points")
+                        print(f"Obs spacing: every {2} grid points")
+                        print(f"Localization scale: {loc_scale} grid points")
+                        print(f"Effective radius: ~{loc_scale*2}-{loc_scale*3} grid points")
+                        print(f"Expected obs influencing each point: ~{(loc_scale*2/2)**2:.0f}")
+                        
+                        kind_tag = "FULL_2D"
+                        if len(ox_arr) == 0:
+                            raise RuntimeError("No observation points selected — check obs config.")
+                        print(f"[obs] kind={kind_tag}, Nobs={len(ox_arr)}")
+                        obs_error = (obs_cfg.get("sigma_dbz", 1.0) * np.ones_like(yo)).astype("float32")
+
+                        # Tempering & localization
+
+                        Xf_grid = xf.astype("float32")
+                        xatemp, deps, hxf = tempered_wloc(st=st,
+                            xf_grid=Xf_grid, yo=yo,
+                            obs_error=obs_error, loc_scales=loc_scales,
+                            ox=ox_arr, oy=oy_arr, oz=oz_arr,
+                            steps=steps
+                        )
+                        Xa = xatemp[..., -1]
+
+                        # save
+                        meta = dict(config=cfg)
+                        tag = cfg.get("experiment_tag", "full2d_multicycle_v1")
+                        outtag = f"{tag}_{date}_temp{temp}_alpha{int(alpha)}_Loc{int(loc_scale)}_True{int(truth_member)}_kind{kind_tag}"
+                        _save_run(paths["outdir"], outtag,
+                                xa=Xa, xf=xf, hxf=hxf,yo=yo,
+                                deps=deps, steps=steps,obs_error=obs_error,
+                                ox=ox_arr, oy=oy_arr, oz=oz_arr,
+                                truth=truth, meta=meta)
 
 if __name__ == "__main__":
     main()

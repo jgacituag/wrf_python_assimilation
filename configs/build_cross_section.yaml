@@ -1,10 +1,10 @@
 cross_sections_job:
   paths:
-    output: /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/cross_sections/ensemble_cross_sections2_{date}.npz
+    output: /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/cross_sections/ensemble_cross_sections3_{date}.npz
     pattern:  /home/jorge.gacitua/datosmunin2/EXPERIMENTS_UNWEATHER/DATA/PREVENIR_LOWRESOLUTION_HYDRA_2023121612/HIST/FCST/20231216120000/{member}/wrfout_d01_{date}
-    init_date: 2023-12-16_18:00:00
-    end_date: 2023-12-16_20:00:00
-    freq: 1H
+    init_date: 2023-12-16_19:00:00
+    end_date: 2023-12-16_19:00:00
+    freq: 1h
   ensemble:
     mem_ini: 1
     mem_end: 30

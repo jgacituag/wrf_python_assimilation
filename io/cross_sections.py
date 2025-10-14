@@ -153,8 +153,21 @@ def main():
                     out[:, 0, :, j, 5] = xs_ua.T
                     out[:, 0, :, j, 6] = xs_va.T
                     out[:, 0, :, j, 7] = xs_wa.T
+            # out shape: (nx, 1, nz, Ne, nvar)
+            out = out.astype(np.float32, copy=False)
 
-            np.savez_compressed(out_path, cross_sections=out)
+            # A z-level is "valid" if there's at least one finite value anywhere in that level
+            # across x, ensemble members, and variables.
+            finite_z = np.isfinite(out).any(axis=(0, 1, 3, 4))   # shape (nz,)
+            dropped = int((~finite_z).sum())
+            if dropped:
+                nz0 = out.shape[2]
+                kept_z_levels = np.nonzero(finite_z)[0].astype(np.int32)
+                out = out[:, :, finite_z, :, :]
+                print(f"[clean] dropped {dropped} all-NaN z-level(s); nz {nz0} -> {out.shape[2]}")
+            else:
+                kept_z_levels = np.arange(out.shape[2], dtype=np.int32)
+            np.savez_compressed(out_path, cross_sections=out, kept_z_levels=kept_z_levels)
             print(f"[done] wrote: {out_path}")
 
 if __name__ == "__main__":

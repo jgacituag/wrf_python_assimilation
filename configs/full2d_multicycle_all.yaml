@@ -1,10 +1,9 @@
 paths:
-  prepared: /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/cross_sections/ensemble_cross_sections3_{date}.npz
+  prepared: /home/jorge.gacitua/datosmunin/wrf_python_Assimilation/data/cross_sections/ensemble_cross_sections3_{date}.npz
   #prepared:  /home/jorge.gacitua/datosmunin/CrossSection_Assimilation/Data/ensemble_cross_sections_39-5S.npz
   outdir:   /home/jorge.gacitua/datosmunin/wrf_python_Assimilation/data/runs/full2d_multicycle
 
 state:
-  truth_member: 7
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
 obs:
@@ -16,10 +15,10 @@ da:
   init_date: 2023-12-16_19:00:00
   end_date:  2023-12-16_19:00:00
   freq: 1H
-  ntemp: [3]
-  alpha: [2]
-  loc_scales: [5,5,5] # in x,y,z axis
+  ntemps: [1,2,3]
+  alphas: [0,1,2,3]
+  loc_scale: [5] # in x,y,z axis
 
-experiment_tag: Multicycle_v1
+experiment_tag: Multicycle_v2
 
 

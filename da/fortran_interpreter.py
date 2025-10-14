@@ -31,36 +31,47 @@ def tempered_wloc(st,xf_grid, yo, obs_error, loc_scales, ox, oy, oz, steps):
     ox = np.asarray(ox, dtype="int32")
     oy = np.asarray(oy, dtype="int32")
     oz = np.asarray(oz, dtype="int32")
-    steps = np.asarray(steps, dtype="float32")
 
-    
+    ox_f = (ox.astype(np.int64) + 1).astype("float32")
+    oy_f = (oy.astype(np.int64) + 1).astype("float32")
+    oz_f = (oz.astype(np.int64) + 1).astype("float32")
+    steps = np.asarray(steps, dtype="float32")
 
     xatemp = np.zeros((nx,ny,nz,Ne,nvar, ntemp+1), dtype="float32", order="F")
     xatemp[..., 0] = xf_grid
     deps = np.zeros((ntemp, nobs), dtype="float32")
-    hxf = np.zeros((nobs, Ne), dtype=np.float32, order="F")
-    for it in range(ntemp):
-        print(f"[info] Tempering step {it+1}/{ntemp}, alpha={steps[it]:.3f}")
-        for jj in range(Ne):
-            qr = xatemp[ox, oy, oz, jj, st["var_idx"]["qr"],it]
-            qs = xatemp[ox, oy, oz, jj, st["var_idx"]["qs"],it]
-            qg = xatemp[ox, oy, oz, jj, st["var_idx"]["qg"],it]
-            tt = xatemp[ox, oy, oz, jj, st["var_idx"]["T"] ,it]
-            pp = xatemp[ox, oy, oz, jj, st["var_idx"]["P"] ,it]
-            hxf[:, jj] = cda.calc_ref(qr, qs, qg, tt, pp)
+    hxf = np.zeros((nobs,Ne), dtype=np.float32, order="F")
+    hxfs = np.zeros((ntemp,nobs, Ne), dtype=np.float32, order="F")
 
-        dep = yo - hxf.mean(axis=1).astype("float32")
+    for it in range(ntemp):
+        #print(f"[info] Tempering step {it+1}/{ntemp}, alpha_temp={steps[it]:.3f}")
+        for ii in range(nobs):
+            oxi, oyi, ozi = ox[ii], oy[ii], oz[ii]
+            for jj in range(Ne):
+                qr = xatemp[oxi, oyi, ozi, jj, st["var_idx"]["qr"], it]
+                qs = xatemp[oxi, oyi, ozi, jj, st["var_idx"]["qs"], it]
+                qg = xatemp[oxi, oyi, ozi, jj, st["var_idx"]["qg"], it]
+                tt = xatemp[oxi, oyi, ozi, jj, st["var_idx"]["T"],  it]
+                pp = xatemp[oxi, oyi, ozi, jj, st["var_idx"]["P"],  it]
+                hxf[ii, jj] = cda.calc_ref(qr, qs, qg, tt, pp)
+        
+        hxfs[it, :,:] = hxf
+        dep = np.asfortranarray(yo - hxf.mean(axis=1).astype("float32"), dtype="float32")
         deps[it, :] = dep
-        oerr_temp = obs_error * (1.0 / steps[it])
-        print('starting LETKF...')
+        #print(f'hxf shape: {hxf.shape}')
+        #print(f'dep shape: {dep.shape}')
+        oerr_temp = (obs_error / steps[it]).astype("float32")
+        print(f'starting LETKF with loc_scales={loc_scales}, oerr mean={oerr_temp.mean():.3f}')
         Xa = cda.simple_letkf_wloc(
             nx=nx, ny=ny, nz=nz,
             nbv=Ne, nvar=nvar, nobs=nobs,
             hxf=hxf, xf=xatemp[..., it],
-            dep=dep, ox=ox, oy=oy, oz=oz,
+            dep=dep, ox=ox_f, oy=oy_f, oz=oz_f,
             locs=loc_scales, oerr=oerr_temp
         ).astype("float32")
 
         xatemp[..., it+1] = Xa
-
-    return xatemp, deps
+        spread = xatemp[..., it].std(axis=3).mean()
+        increment = np.abs(xatemp[..., it+1] - xatemp[..., it]).mean()
+        print(f"Step {it}: increment magnitude = {increment:.6f}, spread = {spread:.4f}")
+    return xatemp, deps, hxfs

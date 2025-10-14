@@ -53,7 +53,7 @@ ENDDO
 
 !$OMP PARALLEL DO PRIVATE(ix,iy,iz,iv,im,im2,wa,wamean,pa,xfmean,xfpert,rloc)
 DO ix = 1 , nx
-  write(*,*) ix, '/', nx
+  !write(*,*) ix, '/', nx
   DO iy = 1 , ny
     DO iz = 1 , nz
        !write(*,*) 'point (xi,iy,iz)' , ix, iy, iz
@@ -68,9 +68,9 @@ DO ix = 1 , nx
        !Computing simple localization
        CALL simple_loc( ix , iy , iz , ox , oy , oz , locs , nobs , rloc )
 
-       rloc(:) = oerr(:) / rloc(:) 
+       rloc(:) = oerr(:) / MAX( rloc(:), 1.0e-6_r_size )
 
-       CALL letkf_core(nbv,1,hxfpert,rloc,   &
+       CALL letkf_core(nbv,nobs,hxfpert,rloc,   &
                     dep_rsize,infl,wa,wamean,pa,1.0d0)
 
        !Apply the weights and update the state variables. 
