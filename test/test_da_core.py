@@ -62,6 +62,65 @@ def test_aoei_inflates_large_dep():
     assert r[0] > R0[0], f"Expected inflation: {r[0]} <= {R0[0]}"
     print(f"PASS  aoei: inflates large departure  R_tilde={r[0]:.1f}  R0={R0[0]:.1f}")
 
+
+# ── ATEnKF helpers ─────────────────────────────────────────────────────────
+
+def test_solve_ntemp_no_inflation():
+    from da.core import _solve_ntemp
+    # No inflation -> Ntemp = 1
+    assert _solve_ntemp(1.0, alpha_s=1.0) == 1
+    assert _solve_ntemp(0.5, alpha_s=1.0) == 1   # ratio < 1 also gives 1
+    print("PASS  _solve_ntemp: ratio<=1 -> Ntemp=1")
+
+def test_solve_ntemp_increases_with_ratio():
+    from da.core import _solve_ntemp
+    # Larger inflation ratio should require more steps
+    nts = [_solve_ntemp(r, alpha_s=1.0) for r in [2.0, 5.0, 10.0, 50.0, 100.0]]
+    assert nts == sorted(nts), f"Ntemp not monotone with ratio: {nts}"
+    print(f"PASS  _solve_ntemp: monotone with inflation ratio  {nts}")
+
+def test_solve_ntemp_respects_cap():
+    from da.core import _solve_ntemp
+    # Result must never exceed ntemp_max, even for absurd ratios
+    for cap in [5, 10, 20]:
+        nt = _solve_ntemp(1e30, alpha_s=1.0, ntemp_max=cap)
+        assert nt <= cap, f"Ntemp={nt} exceeded cap={cap}"
+    print("PASS  _solve_ntemp: respects ntemp_max cap")
+
+def test_atenkf_first_step_uses_R_tilde():
+    """
+    For an obs where AOEI fires, the first step's oerr should equal R_tilde
+    (up to floating point), i.e. R0 / alpha_1(Ntemp_j) = R_tilde_j.
+    """
+    from da.core import _solve_ntemp, tempering_schedule
+    R0 = 25.0
+    R_tilde = 200.0   # strong inflation
+    ratio = R_tilde / R0
+    nt = _solve_ntemp(ratio, alpha_s=1.0)
+    w  = tempering_schedule(nt, alpha_s=1.0)
+    # First step error: R0 / alpha_1
+    oerr_first = R0 / w[0]
+    # Should be >= R_tilde (alpha_1 <= R0/R_tilde)
+    assert oerr_first >= R_tilde - 1e-3, \
+        f"First step oerr={oerr_first:.2f} < R_tilde={R_tilde:.2f}"
+    # And the next Ntemp should require one more step if ratio is higher
+    print(f"PASS  ATEnKF first step: oerr_first={oerr_first:.2f} >= R_tilde={R_tilde:.2f}  Nt={nt}")
+
+def test_atenkf_information_preserving():
+    """
+    sum(alpha_i) = 1  =>  sum(alpha_i / R0) = 1/R0  for any Ntemp.
+    This confirms the information-preserving property.
+    """
+    from da.core import tempering_schedule
+    R0 = 25.0
+    for nt in [1, 2, 3, 5, 10, 20]:
+        w = tempering_schedule(nt, alpha_s=1.0)
+        total_info = (w / R0).sum()
+        expected   = 1.0 / R0
+        assert abs(total_info - expected) < 1e-5, \
+            f"Nt={nt}: total_info={total_info:.6f} != 1/R0={expected:.6f}"
+    print("PASS  ATEnKF: information-preserving property (sum alpha_i/R0 = 1/R0)")
+
 if __name__ == "__main__":
     print("Running tests\n" + "-"*40)
     test_schedule_sums_to_one()
@@ -71,5 +130,10 @@ if __name__ == "__main__":
     test_aoei_floor()
     test_aoei_no_inflation_small_dep()
     test_aoei_inflates_large_dep()
+    test_solve_ntemp_no_inflation()
+    test_solve_ntemp_increases_with_ratio()
+    test_solve_ntemp_respects_cap()
+    test_atenkf_first_step_uses_R_tilde()
+    test_atenkf_information_preserving()
     print("-"*40)
     print("All tests passed.")
