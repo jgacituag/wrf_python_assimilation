@@ -1,6 +1,6 @@
 cross_sections_job:
   paths:
-    output: /home/jorge.gacitua/datosdemerzel/wrf_python_Assimilation/data/cross_sections/ensemble_3D_sections_{date}.npz
+    output: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets/ensemble_3D_sections_{date}.npz
     pattern:  /home/jorge.gacitua/datosmunin2/EXPERIMENTS_UNWEATHER/DATA/PREVENIR_LOWRESOLUTION_HYDRA_2023121612/HIST/FCST/20231216120000/{member}/wrfout_d01_{date}
     init_date: 2023-12-16_19:00:00
     end_date: 2023-12-16_19:00:00
@@ -12,9 +12,9 @@ cross_sections_job:
   variables: ["QGRAUP","QRAIN","QSNOW","temp","pressure","ua","va","wa"]
   subset_3d:
       i_start: 174  # Replace with your value
-      i_end: 280   # Replace with your value
+      i_end: 280    # Replace with your value
       j_start: 223  # Replace with your value
-      j_end: 339   # Replace with your value
-      k_start: 0   # Start at ground level
-      k_end: -1    # Up to model level 34
+      j_end: 339    # Replace with your value
+      k_start: 0    # Start at ground level
+      k_end: -1     # Up to last model level
       timeidx: -1

@@ -5,7 +5,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-SRC_DIR="$ROOT/fortran"
+SRC_DIR="$ROOT/src/fortran"
 
 cd "$SRC_DIR"
 rm -f *.mod *.so
