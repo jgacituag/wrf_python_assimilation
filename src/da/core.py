@@ -1,10 +1,48 @@
+"""
+src/da/core.py
+==============
+Single source of truth for all DA methods used in the WS experiments.
+
+Public API
+----------
+  tempering_schedule(ntemp, alpha_s)             -> ndarray (ntemp,)
+  compute_hxf(xf, ox, oy, oz, var_idx)           -> ndarray (nobs, Ne)
+  aoei(yo, hxf, R0)                              -> ndarray (nobs,)
+  letkf_update(xf, yo, R0, ox, oy, oz, L, vi)   -> dict
+  tenkf_update(..., ntemp, alpha_s)              -> dict
+  aoei_update(...)                               -> dict
+  atenkf_update(..., ntemp, alpha_s)             -> dict
+
+Conventions
+-----------
+- obs_error / R0 : always obs error VARIANCE (sigma^2), NOT std.
+- sigma_dbz in configs is std; square it before passing here.
+- All heavy arrays are float32.
+- The Fortran backend is loaded lazily so unit tests run without it.
+"""
+
 import os, sys
 import numpy as np
 
+# ── Verbosity ──────────────────────────────────────────────────────────────
+# 0=silent  1=method start/finish  2=per-step  3=debug
+# Set once per process with set_verbose(level).
 
-################ auxiliry general functions ##############
+_VERBOSE = 1
+
+def set_verbose(level: int):
+    """Set verbosity for all DA methods in this process."""
+    global _VERBOSE
+    _VERBOSE = int(level)
+
+def _log(level: int, msg: str):
+    if _VERBOSE >= level:
+        print(msg, flush=True)
+
+# ── Lazy Fortran loader ────────────────────────────────────────────────────
 
 _cda = None
+
 def _get_cda():
     global _cda
     if _cda is not None:
@@ -25,9 +63,12 @@ def _get_cda():
         "Run src/build_fortran.sh from the repo root first."
     )
 
+
+# ── Tempering schedule ─────────────────────────────────────────────────────
+
 def tempering_schedule(ntemp: int, alpha_s: float) -> np.ndarray:
     """
-    Back-loaded exponential weights
+    Back-loaded exponential weights (Eq. 12).
 
         alpha_i = exp(-(Nt+1)*alpha_s / i) / sum_j exp(-(Nt+1)*alpha_s / j)
 
@@ -43,6 +84,9 @@ def tempering_schedule(ntemp: int, alpha_s: float) -> np.ndarray:
     w = np.exp(-(ntemp + 1) * float(alpha_s) / i)
     w /= w.sum()
     return w.astype(np.float32)
+
+
+# ── Observation operator ───────────────────────────────────────────────────
 
 def compute_hxf(xf_grid: np.ndarray,
                 ox: np.ndarray,
@@ -80,6 +124,8 @@ def compute_hxf(xf_grid: np.ndarray,
     return hxf
 
 
+# ── AOEI ───────────────────────────────────────────────────────────────────
+
 def aoei(yo: np.ndarray,
          hxf: np.ndarray,
          R0: np.ndarray) -> np.ndarray:
@@ -111,6 +157,8 @@ def aoei(yo: np.ndarray,
     return np.maximum(R0_, d**2 - sigma2_f).astype(np.float32)
 
 
+# ── Single LETKF step ──────────────────────────────────────────────────────
+
 def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     """
     One LETKF analysis via Fortran.  obs_error_var is R (variance).
@@ -120,7 +168,7 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     nx, ny, nz, Ne, nvar = xf_grid.shape
     nobs = len(yo)
 
-    ox_f = (np.asarray(ox, np.int64) + 1).astype(np.float32)   # 1-based for fortran
+    ox_f = (np.asarray(ox, np.int64) + 1).astype(np.float32)   # 1-based
     oy_f = (np.asarray(oy, np.int64) + 1).astype(np.float32)
     oz_f = (np.asarray(oz, np.int64) + 1).astype(np.float32)
 
@@ -139,6 +187,8 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     )
     return xa.astype(np.float32)
 
+
+# ── High-level DA methods ──────────────────────────────────────────────────
 
 def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     """
@@ -187,14 +237,13 @@ def tenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
         hxfs[it] = hxf
         deps[it] = dep
         oerr = R0 / steps[it]
-        print(f"  [TEnKF]  step {it+1}/{Nt}  "
-              f"alpha={steps[it]:.4f}  R/alpha={oerr.mean():.2f}  "
-              f"|dep|={np.abs(dep).mean():.3f}")
+        _log(2, f"  [TEnKF]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  R/alpha={oerr.mean():.2f}  |dep|={np.abs(dep).mean():.3f}")
         xatemp[..., it + 1] = _letkf_step(
             xatemp[..., it], hxf, yo, oerr, ox, oy, oz, loc_scales)
 
     return dict(xa=xatemp[..., -1], xatemp=xatemp, hxfs=hxfs, deps=deps,
                 alpha_weights=steps, obs_error=R0)
+
 
 def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     """
@@ -209,8 +258,7 @@ def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     R_t = aoei(yo, hxf, R0)
     xa  = _letkf_step(xf_grid, hxf, yo, R_t, ox, oy, oz, loc_scales)
     n_inf = int((R_t > R0).sum())
-    print(f"  [AOEI]  inflated {n_inf}/{len(yo)} obs  "
-          f"R_tilde={R_t.mean():.2f}  R0={R0.mean():.2f}")
+    _log(2, f"  [AOEI]  inflated {n_inf}/{len(yo)} obs  R_tilde={R_t.mean():.2f}  R0={R0.mean():.2f}")
     return dict(
         xa=xa,
         hxf=hxf,
@@ -218,6 +266,52 @@ def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
         obs_error_raw=R0,
         obs_error=R_t,
     )
+
+
+def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
+                  ntemp, alpha_s):
+    """
+    ATEnKF: TEnKF with AOEI recomputed at every tempering step.
+
+    At each step i: recompute H(x), apply AOEI -> R_tilde,
+    then inflate R_tilde / alpha_i, run LETKF.
+
+    Returns
+    -------
+    dict: xa, xatemp, hxfs, deps, obs_error_aoei, obs_error_eff,
+          alpha_weights, obs_error_raw
+    """
+    steps = tempering_schedule(ntemp, alpha_s)
+    R0    = np.asarray(obs_error_var, np.float32)
+    nx, ny, nz, Ne, nvar = xf_grid.shape
+    nobs = len(yo)
+    Nt   = len(steps)
+
+    xatemp         = np.empty((nx, ny, nz, Ne, nvar, Nt + 1), dtype=np.float32, order="F")
+    xatemp[..., 0] = xf_grid.astype(np.float32)
+    hxfs           = np.empty((Nt, nobs, Ne), dtype=np.float32)
+    deps           = np.empty((Nt, nobs),     dtype=np.float32)
+    obs_error_aoei = np.empty((Nt, nobs),     dtype=np.float32)
+    obs_error_eff  = np.empty((Nt, nobs),     dtype=np.float32)
+
+    for it in range(Nt):
+        hxf  = compute_hxf(xatemp[..., it], ox, oy, oz, var_idx)
+        dep  = (yo - hxf.mean(axis=1)).astype(np.float32)
+        R_t  = aoei(yo, hxf, R0)
+        oerr = (R_t / steps[it]).astype(np.float32)
+        hxfs[it] = hxf;  deps[it] = dep
+        obs_error_aoei[it] = R_t;  obs_error_eff[it] = oerr
+        n_inf = int((R_t > R0).sum())
+        _log(2, f"  [ATEnKF] step {it+1}/{Nt}  alpha={steps[it]:.4f}  R_eff={oerr.mean():.2f}  AOEI={n_inf}/{nobs}  |dep|={np.abs(dep).mean():.3f}")
+        xatemp[..., it + 1] = _letkf_step(
+            xatemp[..., it], hxf, yo, oerr, ox, oy, oz, loc_scales)
+
+    return dict(xa=xatemp[..., -1], xatemp=xatemp, hxfs=hxfs, deps=deps,
+                obs_error_aoei=obs_error_aoei, obs_error_eff=obs_error_eff,
+                alpha_weights=steps, obs_error_raw=R0)
+
+
+# ── ATEnKF helpers ─────────────────────────────────────────────────────────
 
 def _solve_ntemp(inflation_ratio: float,
                  alpha_s: float,
@@ -263,6 +357,7 @@ def _per_obs_ntemp(R0: np.ndarray,
     ntemps = np.array([_solve_ntemp(float(r), alpha_s, ntemp_max)
                        for r in ratios], dtype=int)
     return ntemps
+
 
 def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
                   alpha_s: float = 1.0, ntemp_max: int = 20):
@@ -325,8 +420,7 @@ def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
     Nt_global = int(ntemps.max())
 
     n_inflated = int((ntemps > 1).sum())
-    print(f"  [ATEnKF]  AOEI inflated {n_inflated}/{len(yo)} obs  "
-          f"Nt_global={Nt_global}  alpha_s={alpha_s}")
+    _log(1, f"  [ATEnKF]  AOEI inflated {n_inflated}/{len(yo)} obs  Nt_global={Nt_global}  alpha_s={alpha_s}")
 
     # Precompute schedules for each unique Ntemp value
     unique_nts  = np.unique(ntemps)
@@ -358,8 +452,7 @@ def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
 
         oerr_per_step[k] = oerr
         active = int((oerr < INF).sum())
-        print(f"    step {k+1}/{Nt_global}  active_obs={active}  "
-              f"oerr_mean(active)={oerr[oerr < INF].mean():.2f}")
+        _log(2, f"    step {k+1}/{Nt_global}  active_obs={active}  oerr_mean(active)={oerr[oerr < INF].mean():.2f}")
 
         xatemp[..., k + 1] = _letkf_step(
             xatemp[..., k], hxf, yo, oerr, ox, oy, oz, loc_scales)
@@ -377,6 +470,8 @@ def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
         ntemp_max=ntemp_max,
     )
 
+
+# ── TAOEI ──────────────────────────────────────────────────────────────────
 
 def taoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
                  ntemp: int, alpha_s: float):
@@ -426,9 +521,7 @@ def taoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
         hxfs[it] = hxf;  deps[it] = dep
         obs_error_aoei[it] = R_t;  obs_error_eff[it] = oerr
         n_inf = int((R_t > R0).sum())
-        print(f"  [TAOEI]  step {it+1}/{Nt}  "
-              f"alpha={steps[it]:.4f}  R_eff_mean={oerr.mean():.2f}  "
-              f"AOEI_inf={n_inf}/{nobs}  |dep|={np.abs(dep).mean():.3f}")
+        _log(2, f"  [TAOEI]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  R_eff_mean={oerr.mean():.2f}  AOEI_inf={n_inf}/{nobs}  |dep|={np.abs(dep).mean():.3f}")
         xatemp[..., it + 1] = _letkf_step(
             xatemp[..., it], hxf, yo, oerr, ox, oy, oz, loc_scales)
 
