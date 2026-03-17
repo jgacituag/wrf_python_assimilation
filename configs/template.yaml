@@ -11,7 +11,7 @@
 # On the cluster:
 #   EXP=your_exp qsub queue_ws.sh
 
-# ── metadata ──────────────────────────────────────────────────────────────
+#### metadata ##############################################################
 experiment_tag: MY_EXPERIMENT    # used in output filenames and the config copy
 
 # Verbosity level written to log / stdout
@@ -23,7 +23,7 @@ verbose: 1
 
 skip_existing: False   # default — always overwrite npz file
 skip_existing: True    # resume a partial run without recomputing finished npz files
-# ── paths ─────────────────────────────────────────────────────────────────
+#### paths #################################################################
 paths:
   # Input: .npz produced by src/extract_3d_subset.py
   # Must contain array "state_ensemble" of shape (nx, ny, nz, Ne_tot, nvar)
@@ -33,7 +33,7 @@ paths:
   # A copy of this config file is written here before any results.
   outdir: /path/to/output/
 
-# ── state ─────────────────────────────────────────────────────────────────
+#### state #################################################################
 state:
   # Total number of members in the .npz (truth + prior)
   n_members: 30
@@ -42,12 +42,12 @@ state:
   # (see src/extract_3d_subset.py for the canonical order)
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
-# ── observations ──────────────────────────────────────────────────────────
+#### observations ##########################################################
 obs:
   # Observation error VARIANCE [dBZ²]  (NOT std — do not square this)
   obs_error_var: 25.0    # corresponds to sigma = 5 dBZ
 
-# ── quality control ───────────────────────────────────────────────────────
+#### quality control #######################################################
 qc:
   # Skip points where the ensemble mean in obs space is below dbz_min.
   # Physical motivation: no signal in observation space -> no correction possible.
@@ -65,7 +65,7 @@ qc:
   # Reflectivity threshold [dBZ] used by both filters above
   dbz_min: 5.0
 
-# ── sweep ─────────────────────────────────────────────────────────────────
+#### sweep #################################################################
 # Every dimension supports three formats:
 #   scalar:              5         -> [5]
 #   explicit list:       [3, 5, 7] -> [3, 5, 7]
@@ -83,7 +83,17 @@ sweep:
   # truth_members: [0, 1, 2]
   # truth_members: {start: 0, stop: 29, num: 30}
 
-  # ── observation set ───────────────────────────────────────────────────
+  # How many members to use as the prior ensemble.
+  # Default (null): use all remaining members after removing the truth member.
+  # Set to a scalar or list to study ensemble size sensitivity.
+  # Members are selected sequentially (0, 1, 2, ...) skipping the truth member.
+  # Ne is always recorded in the output filename as _Ne{N}.
+  prior_size: null         # use all remaining members  (default)
+  # prior_size: 20         # fixed prior size
+  # prior_size: [20, 30, 40, 50]              # sensitivity sweep
+  # prior_size: {start: 10, stop: 50, num: 5} # -> [10, 20, 30, 40, 50]
+
+  #### observation set ###################################################
   # Controls how observations are constructed for each run.
   #
   # mode: single
@@ -119,24 +129,24 @@ sweep:
   # obs_points:
   #   mode: all                 # full domain
 
-  # ── DA methods ────────────────────────────────────────────────────────
+  #### DA methods ########################################################
   methods: [LETKF, TEnKF, AOEI, ATEnKF, TAOEI]
   # methods: [LETKF]
 
-  # ── tempering iterations ──────────────────────────────────────────────
+  #### tempering iterations ##############################################
   # Integer parameter.  {start, stop, num} uses rounded linspace values.
   ntemp: 3
   # ntemp: [1, 2, 3]
   # ntemp: {start: 1, stop: 10, num: 10}   # -> [1,2,3,4,5,6,7,8,9,10]
 
-  # ── tempering slope ───────────────────────────────────────────────────
+  #### tempering slope ###################################################
   # Controls back-loading of the tempering schedule (Eq. 12).
   # 0 = equal weights.  Recommended range: [1, 2].
   alpha_s: 2.0
   # alpha_s: [1.0, 2.0, 3.0]
   # alpha_s: {start: 0.0, stop: 3.0, num: 4}
 
-  # ── localization length scales [grid points] ──────────────────────────
+  #### localization length scales [grid points] ##########################
   # Separate values for x (west-east), y (south-north), z (vertical).
   # Use 9999 (or null) to disable localization on an axis.
   # R-localization: obs error inflated by exp(0.5*(d/L)^2) at distance d.
@@ -147,7 +157,7 @@ sweep:
   # loc_z: {start: 2.0, stop: 8.0, num: 4}
   # loc_x: null    # disables x-localization (L=9999)
 
-# ── parallelism ───────────────────────────────────────────────────────────
+#### paralle Process ###########################################################
 # Handled at the command line (--workers N) or in queue_ws.sh.
 # Each truth member runs in its own process; all processes are independent.
 # Recommended: workers = min(n_truth_members, available_cores)

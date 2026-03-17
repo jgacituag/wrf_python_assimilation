@@ -1,6 +1,6 @@
 # WRF Single-Cycle Assimilation
 
-Radar data assimilation experiments with a 30-member WRF supercell ensemble,
+Radar data assimilation experiments with a real cases WRF ensemble,
 using the Local Ensemble Transform Kalman Filter (LETKF) and likelihood
 tempering (TEnKF).
 ---
@@ -11,20 +11,14 @@ tempering (TEnKF).
 .
 ├── src/
 │   ├── da/
-│   │   └── core.py                        # All DA methods (LETKF, TEnKF, AOEI, ATEnKF, TAOEI)
+│   │   └── core.py                  # All DA methods (LETKF, TEnKF, AOEI, ATEnKF, TAOEI)
 │   ├── runners/
-│   │   ├── run_single_obs_exps.py         # WS-1, WS-2
-│   │   └── run_full3d_multicycle_exps.py  # WS-3, WS-4, WS-5
-│   ├── extract_3d_subset.py               # Extract WRF ensemble subsets to .npz
-│   ├── selectors.py                       # Observation grid selectors
-│   └── fortran/                           # Fortran LETKF source + Makefile
+│   │   └── run_experiment.py        # Unified runner for all WS experiments
+│   ├── extract_3d_subset.py         # Extract WRF ensemble subsets to .npz
+│   └── fortran/                     # Fortran LETKF source + Makefile
 ├── configs/
-│   ├── build_3D_section.yaml    # Config for data extraction (Notebook 1)
-│   ├── ws1.yaml                 # WS-1: Ntemp sweep
-│   ├── ws2.yaml                 # WS-2: obs position comparison
-│   ├── ws3.yaml                 # WS-3: multiple obs, no QC filter
-│   ├── ws4.yaml                 # WS-4: multiple obs, with QC filter
-│   └── ws5.yaml                 # WS-5: localization/inflation tuning
+│   ├── template.yaml                # Full reference template — start here
+│   └── build_3D_section.yaml        # Data extraction config (Notebook 1)
 ├── Notebooks/
 │   ├── S1_Explore_and_extract_3d_sections_WRF.ipynb
 │   └── S2_obs_explorer_ws2.ipynb
@@ -116,146 +110,98 @@ alpha_i = exp(-(Nt+1)*alpha_s / i) / sum_j exp(-(Nt+1)*alpha_s / j)
 `R0` (information-preserving property). Larger `alpha_s` back-loads weight
 toward later iterations; `alpha_s = 0` gives equal weights.
 
+### Localization
+
+R-localization (Greybush et al. 2011). The Fortran inflates observation error
+by `exp(0.5*(d/L)^2)` at distance `d` from a grid point with scale `L`.
+Set `loc_x/y/z: 99999` (or `null`) to disable localization on an axis.
 ---
 
-## Experiments
+## Running experiments
 
-All experiments use a **single-cycle** (no cycling) setup. The full ensemble
-of 30 members is used: at each run one member is withheld as truth and the
-remaining 29 form the prior ensemble. All 30 combinations are looped over.
+### 1. Sanity check first
 
-### WS-1 — Ntemp sweep
-
-**Question:** how many tempering iterations are needed in 3D WRF before
-performance saturates?
-
-- Single observation at a fixed grid location
-- Methods: LETKF (baseline) and TEnKF for Ntemp = 1…10
-- Fixed `alpha_s = 2`, all 30 truth members
+Before any full run, verify all methods work correctly on a single point:
 
 ```bash
-# Set paths.prepared and paths.outdir in configs/ws1.yaml first
-python src/runners/run_single_obs_exps.py --config configs/ws1.yaml
+python tests/run_sanity_check.py --config configs/ws2.yaml \
+    --truth 0 --x 10 --y 0 --z 15
 ```
 
+Prints a table showing prior diagnostics, AOEI inflation ratio, ATEnKF
+`Ntemp_j`, posterior mean per method, and innovation reduction percentage.
+
+### 2. Run an experiment
+
+All experiments use the same runner — the config controls everything:
+
+```bash
+python src/runners/run_experiment.py --config configs/ws1.yaml
+python src/runners/run_experiment.py --config configs/ws2.yaml --workers 30
+python src/runners/run_experiment.py --config configs/ws2.yaml --verbose 1
+```
+
+### 3. Submit to cluster
+
+```bash
+qsub -v CFG=configs/ws2.yaml,WORKERS=30 queue_ws.sh
+qsub -v CFG=configs/ws3.yaml,WORKERS=30 queue_ws.sh
+```
 ---
 
-### WS-2 — Observation position comparison
+## Output files
 
-**Question:** how do methods respond to observations at different positions
-relative to the prior ensemble — near the mean, above it, or below it?
+A copy of the config yaml is written to `outdir` before any results, so
+every output folder is self-contained.
 
-- Three fixed observation locations (A: near mean, B: above mean, C: below mean)
-- Methods: LETKF, TEnKF, AOEI, ATEnKF
-- Ntemp fixed from WS-1 results, all 30 truth members
+### Filename convention
 
-```bash
-# Set paths.prepared, paths.outdir, and obs_positions in configs/ws2.yaml
-python src/runners/run_single_obs_exps.py --config configs/ws2.yaml
+**Single-obs:**
+```
+{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_obs{x}_{y}_{z}_qc{qc}_True{tm}.npz
+```
+ 
+**Multi-obs:**
+```
+{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz
 ```
 
-Observation positions are selected using the exploration notebook
-(`obs_explorer_ws2.ipynb`) or by inspecting the extracted `.npz` directly.
-Placeholder values `(x:0, y:0, z:0)` are set in the config until final
-positions are chosen.
+**QC code:**
 
----
+| Code | Meaning |
+|------|---------|
+| `none` | no filtering |
+| `E` | ensemble mean filter only |
+| `T` | truth filter only |
+| `ET_and` | both filters, AND logic |
+| `ET_or` | both filters, OR logic |
 
-### WS-3 — Multiple observations, no QC filter
+### Array contents per file
 
-**Question:** how do methods scale to a dense radar-like observation network?
-
-- Uniform `::2` stride grid over the full 3D domain
-- Methods: LETKF, TEnKF, AOEI, ATEnKF
-- No near-zero departure filtering, all 30 truth members
-
-```bash
-python src/runners/run_full3d_multicycle_exps.py --config configs/ws3.yaml
-```
-
----
-
-### WS-4 — Multiple observations, with QC filter
-
-Same as WS-3 but with near-zero departure filtering enabled: grid points
-where both truth and ensemble mean are below `dbz_min = 5 dBZ` are dropped,
-mimicking operational clear-air quality control.
-
-```bash
-python src/runners/run_full3d_multicycle_exps.py --config configs/ws4.yaml
-```
-
----
-
-### WS-5 — Localization and inflation tuning
-
-**Question:** what are the optimal localization scale and inflation for the
-best methods from WS-2/3/4?
-
-- 2–3 best-performing methods from previous experiments
-- Sweeps `loc_scales` over `[3, 5, 7, 10]` grid points
-- Fixed Ntemp from WS-1, filtered obs (WS-4 setup)
-
-```bash
-python src/runners/run_full3d_multicycle_exps.py --config configs/ws5.yaml
-```
-
----
-
-## Running the tests
-
-```bash
-python tests/test_da_core.py
-```
-
-Covers: tempering schedule properties, AOEI floor guarantee, ATEnKF
-per-observation Ntemp logic, and the information-preserving property.
+| Key | Description |
+|-----|-------------|
+| `xa` | posterior ensemble `(nx,ny,nz,Ne,nvar)` |
+| `yo` | observations used |
+| `hxf_mean` | prior ensemble mean in obs space |
+| `dep` | innovation `yo - H(x̄^f)` |
+| `spread` | prior ensemble spread in obs space |
+| `obs_error` | obs error variance used (after AOEI if applicable) |
+| `ox, oy, oz` | obs grid indices |
+| `truth_member` | which member was used as truth |
+| `xatemp` *(TEnKF/ATEnKF)* | ensemble at each tempering step |
+| `ntemps_per_obs` *(ATEnKF)* | per-observation Ntemp_j |
 
 ---
 
 ## Config reference
 
-```yaml
-# ── ws1.yaml / ws2.yaml  (run_single_obs_exps.py) ─────────────────────────
-experiment: WS-1   # or WS-2
+See `configs/template.yaml` for the full documented reference with all
+options, accepted formats, and defaults. Key points:
 
-paths:
-  prepared:  /path/to/state_ensemble.npz
-  outdir:    /path/to/output/
-
-state:
-  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
-
-obs:
-  sigma_dbz: 5.0              # obs error std [dBZ] — squared to variance internally
-  loc: {x: 0, y: 0, z: 0}    # single location (WS-1)
-  # obs_positions:            # three locations (WS-2)
-  #   A_near_mean:  {x: ?, y: ?, z: ?}
-  #   B_above_mean: {x: ?, y: ?, z: ?}
-  #   C_below_mean: {x: ?, y: ?, z: ?}
-
-da:
-  ntemp_sweep: [1,2,3,4,5,6,7,8,9,10]   # WS-1: Ntemp values to test
-  ntemp:   3                             # WS-2: fixed Ntemp (from WS-1 results)
-  alpha_s: 2.0
-  loc_scales: [5, 5, 5]                  # localization [x, y, z] grid points
-
-# ── ws3.yaml – ws5.yaml  (run_full3d_multicycle_exps.py) ──────────────────
-paths:
-  prepared:  /path/to/state_ensemble.npz
-  outdir:    /path/to/output/
-
-obs:
-  sigma_dbz: 5.0
-  stride: 2                    # obs every N grid points in each dimension
-  filter_near_zero: false      # true for WS-4 and WS-5
-  dbz_min: 5.0
-
-da:
-  ntemps:  [1, 3]              # list of Ntemp values to run
-  alphas:  [2.0]               # list of alpha_s values to run
-  loc_scales_list:             # list of [lx, ly, lz] combinations
-    - [5, 5, 5]
-  methods: [LETKF, TEnKF, AOEI, ATEnKF]
-  n_members: 30
+- `obs_error_var` is variance (dBZ²), not std
+- `prior_size: null` uses all remaining members (default); set to scalar or list for ensemble size sensitivity — always recorded as `_Ne{N}` in the filename
+- Sweep parameters accept scalar, list, or `{start, stop, num}` (stop inclusive)
+- `loc_x/y/z: null` disables localization (equivalent to L=99999)
+- `skip_existing: true` resumes a partial run without recomputing finished files
+- `verbose: 1` is recommended for cluster runs (one line per truth member)
 ```
