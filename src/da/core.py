@@ -1,6 +1,6 @@
 import os, sys
 import numpy as np
-
+import time
 #### Verbosity 
 # 0=silent  1=method start/finish  2=per-step  3=debug
 # Set once per process with set_verbose(level).
@@ -82,7 +82,7 @@ def compute_hxf(xf_grid: np.ndarray,
     cda  = _get_cda()
     nobs = len(ox)
     Ne   = xf_grid.shape[3]
-    hxf  = np.empty((nobs, Ne), dtype=np.float32)
+    hxf  = np.empty((nobs, Ne), dtype=np.float32, order="F")
     _log(3, f"Computing H(xf) for {nobs} obs and {Ne} ensemble members...")
     for ii in range(nobs):
         i, j, k = int(ox[ii]), int(oy[ii]), int(oz[ii])
@@ -126,21 +126,21 @@ def compute_loc_weights(nx: int, ny: int, nz: int,
     lx, ly, lz = float(locs[0]), float(locs[1]), float(locs[2])
 
     # compact-support cutoff in grid-point units (horizontal only, as in advisor's code)
-    max_dist = 2.0 * (10.0 / 3.0) ** 0.5 * max(lx if lx > 0 else 0.0,
-                                                  ly if ly > 0 else 0.0)
+    max_dist = 2.0 * (10.0 / 3.0) ** 0.5 * max(lx if lx > 0 else 0.0,ly if ly > 0 else 0.0,lz if lz > 0 else 0.0)
 
-    ii = np.arange(nx, dtype=np.float32)
-    jj = np.arange(ny, dtype=np.float32)
-    kk = np.arange(nz, dtype=np.float32)
+    ii = np.arange(nx, dtype=np.float32)[:, np.newaxis, np.newaxis]
+    jj = np.arange(ny, dtype=np.float32)[np.newaxis, :, np.newaxis]
+    kk = np.arange(nz, dtype=np.float32)[np.newaxis, np.newaxis, :]
 
     dist = np.zeros((nx, ny, nz), dtype=np.float32)
     if lx > 0.0:
-        dist += ((ii - i0) / lx)[:, np.newaxis, np.newaxis] ** 2
+        dist += ((ii - i0) / lx) ** 2
     if ly > 0.0:
-        dist += ((jj - j0) / ly)[np.newaxis, :, np.newaxis] ** 2
+        dist += ((jj - j0) / ly) ** 2
     if lz > 0.0:
-        dist += ((kk - k0) / lz)[np.newaxis, np.newaxis, :] ** 2
+        dist += ((kk - k0) / lz) ** 2
 
+    # Apply the cutoff logic using max_dist
     rloc = np.where(dist <= max_dist, np.exp(-0.5 * dist), np.nan).astype(np.float32)
     return rloc
 
@@ -192,17 +192,26 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     dep    = (yo - hxf.mean(axis=1)).astype(np.float32)
     oerr_f = np.asarray(obs_error_var, np.float32)
     locs_f = np.asarray(loc_scales,    np.float32)
+
     _log(3, f"Running LETKF step with obs_error_var mean={oerr_f.mean():.2f} and nobs={nobs}...")
-    xa = cda.simple_letkf_wloc(
+
+    t0 = time.time()
+
+    xa_out, n_updated = cda.simple_letkf_wloc(
         nx=nx, ny=ny, nz=nz,
         nbv=Ne, nvar=nvar, nobs=nobs,
-        hxf=np.asfortranarray(hxf.astype(np.float32)),
-        xf=np.asfortranarray(xf_grid.astype(np.float32)),
+        hxf=np.asfortranarray(hxf),
+        xf=np.asfortranarray(xf_grid),
         dep=dep,
         ox=ox_f, oy=oy_f, oz=oz_f,
         locs=locs_f, oerr=oerr_f,
     )
-    return xa.astype(np.float32)
+    dt = time.time() - t0
+    total_pts = nx * ny * nz
+    pct_skipped = ((total_pts - n_updated) / total_pts) * 100
+    
+    _log(3, f"      [Fortran LETKF] {dt:.3f}s | Updated {int(n_updated)}/{total_pts} pts (Skipped {pct_skipped:.1f}%)")
+    return xa_out.astype(np.float32)
 
 
 def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
@@ -235,28 +244,40 @@ def tenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
     -------
     dict: xa, xatemp, hxfs, deps, alpha_weights, obs_error
     """
+    t_start = time.time()
     steps = tempering_schedule(ntemp, alpha_s)
     R0    = np.asarray(obs_error_var, np.float32)
     nx, ny, nz, Ne, nvar = xf_grid.shape
     nobs = len(yo)
     Nt   = len(steps)
 
-    xatemp = np.empty((nx, ny, nz, Ne, nvar, Nt + 1), dtype=np.float32, order="F")
-    xatemp[..., 0] = xf_grid.astype(np.float32)
+    x_af = xf_grid.copy(order="F") # current forecast ensemble, updated at each step with the latest analysis 
     hxfs = np.empty((Nt, nobs, Ne), dtype=np.float32)
     deps = np.empty((Nt, nobs),     dtype=np.float32)
 
+    _log(3, f"  [TEnKF] Starting {Nt} tempering steps (alpha_s={alpha_s:.2f})")
     for it in range(Nt):
-        hxf = compute_hxf(xatemp[..., it], ox, oy, oz, var_idx)
+        t_step = time.time()
+        
+        t_h = time.time()
+        hxf = compute_hxf(x_af, ox, oy, oz, var_idx)
+        dt_h = time.time() - t_h
+
         dep = (yo - hxf.mean(axis=1)).astype(np.float32)
         hxfs[it] = hxf
         deps[it] = dep
         oerr = R0 / steps[it]
-        _log(2, f"  [TEnKF]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  R/alpha={oerr.mean():.2f}  |dep|={np.abs(dep).mean():.3f}")
-        xatemp[..., it + 1] = _letkf_step(
-            xatemp[..., it], hxf, yo, oerr, ox, oy, oz, loc_scales)
 
-    return dict(xa=xatemp[..., -1], xatemp=xatemp, hxfs=hxfs, deps=deps,
+        _log(2, f"  [TEnKF]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  R/alpha={oerr.mean():.2f}  |dep|={np.abs(dep).mean():.3f}")
+        _log(3, f"    H(x) time: {dt_h:.3f}s")
+
+        x_af = _letkf_step(
+            x_af, hxf, yo, oerr, ox, oy, oz, loc_scales)
+        
+        _log(3, f"    Step {it+1} complete in {time.time() - t_step:.3f}s")
+
+    _log(3, f"  [TEnKF Total] All {Nt} steps finished in {time.time() - t_start:.3f}s")         
+    return dict(xa=x_af, hxfs=hxfs, deps=deps,
                 alpha_weights=steps, obs_error=R0)
 
 
@@ -268,12 +289,18 @@ def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     -------
     dict: xa, hxf, dep, obs_error_raw, obs_error
     """
+    t_start = time.time()
     R0  = np.asarray(obs_error_var, np.float32)
+    t_h = time.time()
     hxf = compute_hxf(xf_grid, ox, oy, oz, var_idx)
+    _log(3, f"    [AOEI] H(x) calculated in {time.time() - t_h:.3f}s")
+
     R_t = aoei(yo, hxf, R0)
-    xa  = _letkf_step(xf_grid, hxf, yo, R_t, ox, oy, oz, loc_scales)
     n_inf = int((R_t > R0).sum())
-    _log(2, f"  [AOEI]  inflated {n_inf}/{len(yo)} obs  R_tilde={R_t.mean():.2f}  R0={R0.mean():.2f}")
+    _log(3, f"    [AOEI] Inflated {n_inf}/{len(yo)} obs | R_tilde={R_t.mean():.2f} | R0={R0.mean():.2f}")
+    xa  = _letkf_step(xf_grid, hxf, yo, R_t, ox, oy, oz, loc_scales)
+  
+    _log(3, f"  [AOEI Total] cycle finished in {time.time() - t_start:.3f}s")
     return dict(
         xa=xa,
         hxf=hxf,

@@ -55,6 +55,11 @@ from da.core import (
     atenkf_update, taoei_update,
 )
 
+def _get_cda():
+    """Lazy import of the Fortran module — fails clearly if not built."""
+    from cletkf_wloc import common_da as cda
+    return cda
+
 
 # ## sweep parameter helpers ################################################
 
@@ -224,7 +229,7 @@ def _select_prior(ens, tm, prior_size=None):
             )
         all_others = all_others[:prior_size]
     truth = ens[:, :, :, tm, :]
-    xf    = ens[:, :, :, all_others, :].astype(np.float32)
+    xf    = np.asfortranarray(ens[:, :, :, all_others, :].astype(np.float32))
     return truth, xf, len(all_others)
 
 
@@ -387,30 +392,88 @@ def _worker(args):
                 res = _run_method(method, xf, yo_arr, R0,
                                   ox_arr, oy_arr, oz_arr,
                                   loc_scales, var_idx, ntemp, alpha_s)
-                core._log(3, f"    DA done  {time.time()-_t:.2f}s")
+                core._log(2, f"    DA done  {time.time()-_t:.2f}s")
 
                 _t = time.time()
                 hxf_pt = ens_hx[ox_arr, oy_arr, oz_arr, :]  # (nobs, Ne)
-                save = dict(
-                    xa=res["xa"],
-                    yo=yo_arr,
-                    hxf_mean=hxf_pt.mean(axis=1).astype(np.float32),
-                    dep=(yo_arr - hxf_pt.mean(axis=1)).astype(np.float32),
-                    spread=hxf_pt.std(axis=1, ddof=1).astype(np.float32),
-                    obs_error=np.asarray(res.get("obs_error",
-                                         res.get("obs_error_raw", R0)),
-                                         np.float32),
-                    ox=ox_arr, oy=oy_arr, oz=oz_arr,
-                    truth_member=np.int32(tm),
-                    Ne=np.int32(Ne),
-                )
-                for key in ("xatemp","hxfs","deps","alpha_weights",
-                            "ntemps_per_obs","obs_error_aoei","obs_error_eff"):
-                    if key in res:
-                        save[key] = res[key]
+
+                if obs_mode in ("single", "full_grid"):
+                    # ── single-obs: scalars only, xa discarded ───────────
+                    # The full analysis (nx,ny,nz,Ne,nvar) is computed by
+                    # the Fortran but we extract only what we need from it
+                    # and immediately free it. Nothing > (nvar,) is stored.
+                    xa      = res["xa"]                   # (nx,ny,nz,Ne,nvar)
+                    xa_mean = xa.mean(axis=3)             # (nx,ny,nz,nvar)
+                    i0, j0, k0 = int(ox_arr[0]), int(oy_arr[0]), int(oz_arr[0])
+                    cda = _get_cda()
+                    vi  = var_idx
+
+                    # H(xa) at the obs point for each ensemble member
+                    hxa_pt = np.array([
+                        cda.calc_ref(
+                            xa[i0,j0,k0,m,vi["qr"]], xa[i0,j0,k0,m,vi["qs"]],
+                            xa[i0,j0,k0,m,vi["qg"]], xa[i0,j0,k0,m,vi["T"]],
+                            xa[i0,j0,k0,m,vi["P"]],
+                        ) for m in range(Ne)
+                    ], dtype=np.float32)
+
+                    save = dict(
+                        # observation identity
+                        obs_x=np.int32(i0),
+                        obs_y=np.int32(j0),
+                        obs_z=np.int32(k0),
+                        # obs-space scalars at the obs point
+                        yo=np.float32(yo_arr[0]),
+                        hxf_mean_obs=np.float32(hxf_pt.mean()),
+                        hxa_mean_obs=np.float32(hxa_pt.mean()),
+                        spread_f_obs=np.float32(hxf_pt.std(ddof=1)),
+                        spread_a_obs=np.float32(hxa_pt.std(ddof=1)),
+                        dep_b=np.float32(yo_arr[0] - hxf_pt.mean()),
+                        dep_a=np.float32(yo_arr[0] - hxa_pt.mean()),
+                        obs_error=np.float32(
+                            res.get("obs_error", res.get("obs_error_raw", R0))[0]),
+                        # state-space point values (nvar,) each
+                        xf_mean_pt=xf[i0,j0,k0,:,:].mean(axis=0).astype(np.float32),
+                        xa_mean_pt=xa_mean[i0,j0,k0,:].astype(np.float32),
+                        truth_pt=truth_base[i0,j0,k0,:].astype(np.float32),
+                        # variable name index for reading the (nvar,) arrays
+                        var_names=np.array(list(var_idx.keys())),
+                        # metadata
+                        truth_member=np.int32(tm),
+                        Ne=np.int32(Ne),
+                    )
+                    # per-tempering-step departures — cheap, useful diagnostic
+                    if "deps" in res:
+                        save["deps"] = res["deps"].astype(np.float32)
+                    if "alpha_weights" in res:
+                        save["alpha_weights"] = res["alpha_weights"]
+
+                    del xa, xa_mean   # free immediately
+
+                else:
+                    # ── multi-obs: full matrices stored ──────────────────
+                    save = dict(
+                        xa=res["xa"],
+                        yo=yo_arr,
+                        hxf_mean=hxf_pt.mean(axis=1).astype(np.float32),
+                        dep=(yo_arr - hxf_pt.mean(axis=1)).astype(np.float32),
+                        spread=hxf_pt.std(axis=1, ddof=1).astype(np.float32),
+                        obs_error=np.asarray(res.get("obs_error",
+                                             res.get("obs_error_raw", R0)),
+                                             np.float32),
+                        ox=ox_arr, oy=oy_arr, oz=oz_arr,
+                        truth_member=np.int32(tm),
+                        Ne=np.int32(Ne),
+                    )
+                    for key in ("xatemp","hxfs","deps","alpha_weights",
+                                "ntemps_per_obs","obs_error_aoei","obs_error_eff"):
+                        if key in res:
+                            save[key] = res[key]
 
                 np.savez_compressed(out_path, **save)
-                core._log(3, f"    save done  {time.time()-_t:.2f}s  -> {fname}")
+                _sz = os.path.getsize(out_path) / 1e3
+                core._log(2, f"    saved {_sz:.1f} KB  {time.time()-_t:.2f}s"
+                             f"  -> {fname}")
                 saved.append(fname)
 
     elapsed = time.time() - t0
@@ -454,6 +517,9 @@ def main():
     data = np.load(cfg["paths"]["prepared"])
     ens  = data["state_ensemble"] if "state_ensemble" in data \
            else data["cross_sections"]
+    
+    print(f"[{tag}] Optimizing memory layout for fortran logic...")
+    ens = np.asfortranarray(ens.astype(np.float32))
 
     n_workers   = args.workers or len(truth_members)
     worker_args = [(tm, ens, cfg, verbose) for tm in truth_members]

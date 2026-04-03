@@ -24,7 +24,7 @@ CONTAINS
 !=======================================================================
 SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
                               hxf, xf, dep, ox, oy, oz,    &
-                              locs, oerr, xa)
+                              locs, oerr, xa, n_updated)
 !=======================================================================
 !
 !  Run one LETKF analysis step at every grid point (ix, iy, iz).
@@ -35,7 +35,7 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
 !                               + ((iy-oy)/ly)^2
 !                               + ((iz-oz)/lz)^2])
 !
-!  Points beyond max_dist = 2*sqrt(10/3)*max(lx,ly) receive
+!  Points beyond max_dist = 2*sqrt(10/3)*max(lx,ly,lz) receive
 !  rho -> 0, so the observation is effectively ignored there.
 !
 !  INPUT
@@ -63,64 +63,84 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
   REAL(r_sngl), INTENT(IN)  :: locs(3)
   REAL(r_sngl), INTENT(IN)  :: oerr(nobs)
   REAL(r_sngl), INTENT(OUT) :: xa(nx, ny, nz, nbv, nvar)
+  INTEGER,      INTENT(OUT) :: n_updated
 
   INTEGER      :: ix, iy, iz, iv, im, im2, io
   REAL(r_size) :: hxfmean(nobs)
   REAL(r_size) :: hxfpert(nobs, nbv)
   REAL(r_size) :: xfmean(nvar)
   REAL(r_size) :: xfpert(nbv, nvar)
-  REAL(r_size) :: rloc(nobs)
+
+  INTEGER      :: local_nobs
+  REAL(r_size) :: rloc_loc(nobs)
+  REAL(r_size) :: hxfpert_loc(nobs, nbv)
+  REAL(r_size) :: dep_loc(nobs)
+
   REAL(r_size) :: wa(nbv, nbv), wamean(nbv), pa(nbv, nbv)
   REAL(r_size) :: oerr_dp(nobs), dep_dp(nobs)
   REAL(r_size) :: infl
   REAL(r_size) :: max_dist, dist
   REAL(r_sngl) :: lx, ly, lz
 
-  infl     = 1.0d0
+  
   oerr_dp  = REAL(oerr, r_size)
   dep_dp   = REAL(dep,  r_size)
   lx = locs(1);  ly = locs(2);  lz = locs(3)
 
   ! Compact-support cutoff (horizontal): beyond this dist observations
   ! have negligible weight and are skipped.
-  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(REAL(lx,r_size), REAL(ly,r_size))
-
+  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(REAL(lx,r_size), MAX(REAL(ly,r_size),REAL(lz,r_size)))
+  n_updated = 0
   ! Pre-compute H(xf) ensemble perturbations (same for all grid points)
   DO io = 1, nobs
     CALL com_mean(nbv, REAL(hxf(io,:), r_size), hxfmean(io))
     hxfpert(io, :) = REAL(hxf(io,:), r_size) - hxfmean(io)
   END DO
 
-!$OMP PARALLEL DO PRIVATE(ix,iy,iz,iv,im,im2,io,dist,rloc,xfmean,xfpert,wa,wamean,pa)
+!$OMP PARALLEL DO PRIVATE(ix,iy,iz,iv,im,im2,io,dist,xfmean,xfpert,wa,wamean,pa, &
+!$OMP                     local_nobs, rloc_loc, hxfpert_loc, dep_loc) &
+!$OMP             REDUCTION(+:n_updated)
   DO ix = 1, nx
     DO iy = 1, ny
       DO iz = 1, nz
 
-        ! ---- localisation weights for this grid point -----------------
+        ! ---- 1. Filter observations for this specific grid point ----
+        infl = 1.0d0
+        local_nobs = 0
         DO io = 1, nobs
           dist = 0.0_r_sngl
           IF (lx > 1.0e-6) dist = dist + ((REAL(ix,r_sngl) - ox(io)) / lx)**2
           IF (ly > 1.0e-6) dist = dist + ((REAL(iy,r_sngl) - oy(io)) / ly)**2
           IF (lz > 1.0e-6) dist = dist + ((REAL(iz,r_sngl) - oz(io)) / lz)**2
-          dist = MIN(dist, 700.0_r_sngl)   ! prevent exp underflow
-          rloc(io) = EXP(-0.5_r_size * REAL(dist, r_size))
+
+          ! Keep observation if it is strictly inside the cutoff
+          IF (dist <= max_dist) THEN
+            local_nobs = local_nobs + 1
+            ! R-localisation: inflate obs error by 1/weight
+            rloc_loc(local_nobs) = oerr_dp(io) / MAX(EXP(-0.5_r_size * REAL(dist, r_size)), 1.0e-6_r_size)
+            hxfpert_loc(local_nobs, :) = hxfpert(io, :)
+            dep_loc(local_nobs) = dep_dp(io)
+          END IF
         END DO
 
-        ! ---- R-localisation: inflate obs error by 1/rho ---------------
-        rloc(:) = oerr_dp(:) / MAX(rloc(:), 1.0e-6_r_size)
-        rloc(:) = MAX(rloc(:), 1.0e-12_r_size)   ! floor after division
-
-        ! ---- prior ensemble mean and perturbations --------------------
+        ! ---- 2. Skip computation entirely if no obs are nearby ----
+        IF (local_nobs == 0) THEN
+          xa(ix,iy,iz,:,:) = xf(ix,iy,iz,:,:)
+          CYCLE
+        END IF
+        n_updated = n_updated + 1
+        ! ---- 3. Prior ensemble mean and perturbations -------------
         DO iv = 1, nvar
           CALL com_mean(nbv, REAL(xf(ix,iy,iz,:,iv), r_size), xfmean(iv))
           xfpert(:, iv) = REAL(xf(ix,iy,iz,:,iv), r_size) - xfmean(iv)
         END DO
 
-        ! ---- LETKF core -----------------------------------------------
-        CALL letkf_core(nbv, nobs, hxfpert, rloc, dep_dp, &
+        ! ---- 4. LETKF core using ONLY local obs -------------------
+        CALL letkf_core(nbv, local_nobs, hxfpert_loc(1:local_nobs, :), &
+                        rloc_loc(1:local_nobs), dep_loc(1:local_nobs), &
                         infl, wa, wamean, pa, 1.0d0)
 
-        ! ---- apply weights to update state variables ------------------
+        ! ---- 5. Apply weights to update state variables -----------
         DO iv = 1, nvar
           xa(ix,iy,iz,:,iv) = REAL(xfmean(iv), r_sngl)
           DO im = 1, nbv

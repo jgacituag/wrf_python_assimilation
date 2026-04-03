@@ -28,13 +28,13 @@
 #   2. Update sweep.obs_points.loc with a precipitating point
 #      (use the S3 notebook to find a point with reflectivity > 20 dBZ)
 
-experiment_tag: WS1_Ntemp_sweep
-verbose: 3          # 1=one line per truth member  2=per-stage timing  3=per-step DA
-skip_existing: true # resume interrupted runs
+experiment_tag: WS1_FullGrid_Test
+verbose: 1          # 1=one line per truth member  2=per-stage timing  3=per-step DA
+skip_existing: false # resume interrupted runs
 
 paths:
   prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
-  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/ws1_below/
+  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/WS1_FullGrid_Test/
 
 state:
   n_members: 60
@@ -51,11 +51,12 @@ qc:
 
 sweep:
   truth_members: 0        # scalar=one member, "all"=all 60, [0,1,2]=list
-  prior_size:    20       # members used as prior (null = all except truth)
+  prior_size:    40       # members used as prior (null = all except truth)
 
   obs_points:
-    mode: single
-    loc: {x: 84, y: 108, z: 5}   # UPDATE: point with reflectivity > dbz_min
+    mode: full_grid
+    #mode: single
+    #loc: {x: 84, y: 108, z: 5}   # UPDATE: point with reflectivity > dbz_min
 
   methods:  [TEnKF]
   ntemp:    {start: 1, stop: 3, num: 3}   
