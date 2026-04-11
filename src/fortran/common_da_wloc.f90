@@ -24,16 +24,21 @@ CONTAINS
 !=======================================================================
 SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
                               hxf, xf, dep, ox, oy, oz,    &
-                              locs, oerr, xa, n_updated)
+                              locs, oerr, pos_km,           &
+                              xa, n_updated)
 !=======================================================================
 !
 !  Run one LETKF analysis step at every grid point (ix, iy, iz).
 !  Localisation is Gaussian R-localisation: observation error is
 !  inflated by 1/rho, where
 !
-!    rho(ix,iy,iz) = exp(-0.5 * [((ix-ox)/lx)^2
-!                               + ((iy-oy)/ly)^2
-!                               + ((iz-oz)/lz)^2])
+!    rho(ix,iy,iz) = exp(-0.5 * [((x_km(ix,iy,iz) - ox_km)/lx)^2
+!                               + ((y_km(ix,iy,iz) - oy_km)/ly)^2
+!                               + ((z_km(ix,iy,iz) - oz_km)/lz)^2])
+!
+!  All distances and scales are in km. pos_km provides the real-space
+!  position of every grid point, which handles non-uniform vertical
+!  levels and any horizontal grid irregularity exactly.
 !
 !  Points beyond max_dist = 2*sqrt(10/3)*max(lx,ly,lz) receive
 !  rho -> 0, so the observation is effectively ignored there.
@@ -46,9 +51,13 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
 !    hxf(nobs,nbv)         : H(xf) — ensemble in obs space
 !    xf(nx,ny,nz,nbv,nvar) : prior ensemble
 !    dep(nobs)             : departures  yo - H(xf_mean)
-!    ox,oy,oz(nobs)        : observation locations (1-based grid indices)
-!    locs(3)               : localisation scales [lx, ly, lz] in grid points
+!    ox,oy,oz(nobs)        : observation positions [km]
+!    locs(3)               : localisation scales [lx, ly, lz] in km
 !    oerr(nobs)            : observation error variance
+!    pos_km(nx,ny,nz,3)   : real-space positions of every grid point [km]
+!                            pos_km(ix,iy,iz,1) = x (east),
+!                            pos_km(ix,iy,iz,2) = y (north),
+!                            pos_km(ix,iy,iz,3) = z (altitude)
 !
 !  OUTPUT
 !    xa(nx,ny,nz,nbv,nvar) : posterior ensemble
@@ -62,6 +71,7 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
   REAL(r_sngl), INTENT(IN)  :: ox(nobs), oy(nobs), oz(nobs)
   REAL(r_sngl), INTENT(IN)  :: locs(3)
   REAL(r_sngl), INTENT(IN)  :: oerr(nobs)
+  REAL(r_sngl), INTENT(IN)  :: pos_km(nx, ny, nz, 3)
   REAL(r_sngl), INTENT(OUT) :: xa(nx, ny, nz, nbv, nvar)
   INTEGER,      INTENT(OUT) :: n_updated
 
@@ -80,17 +90,19 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
   REAL(r_size) :: oerr_dp(nobs), dep_dp(nobs)
   REAL(r_size) :: infl
   REAL(r_size) :: max_dist, dist
-  REAL(r_sngl) :: lx, ly, lz
+  REAL(r_size) :: lx, ly, lz
 
-  
   oerr_dp  = REAL(oerr, r_size)
   dep_dp   = REAL(dep,  r_size)
-  lx = locs(1);  ly = locs(2);  lz = locs(3)
+  lx = REAL(locs(1), r_size)
+  ly = REAL(locs(2), r_size)
+  lz = REAL(locs(3), r_size)
 
-  ! Compact-support cutoff (horizontal): beyond this dist observations
-  ! have negligible weight and are skipped.
-  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(REAL(lx,r_size), MAX(REAL(ly,r_size),REAL(lz,r_size)))
+  ! Compact-support cutoff in km (same formula, now in km units).
+  ! The normalised distance d^2 is dimensionless regardless of units.
+  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(lx, MAX(ly, lz))
   n_updated = 0
+
   ! Pre-compute H(xf) ensemble perturbations (same for all grid points)
   DO io = 1, nobs
     CALL com_mean(nbv, REAL(hxf(io,:), r_size), hxfmean(io))
@@ -105,13 +117,19 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
       DO iz = 1, nz
 
         ! ---- 1. Filter observations for this specific grid point ----
+        !  Distance is computed in km using pos_km. The formula is
+        !  identical to the grid-point version — only the coordinate
+        !  system changes. pos_km is read-only (shared across threads).
         infl = 1.0d0
         local_nobs = 0
         DO io = 1, nobs
-          dist = 0.0_r_sngl
-          IF (lx > 1.0e-6) dist = dist + ((REAL(ix,r_sngl) - ox(io)) / lx)**2
-          IF (ly > 1.0e-6) dist = dist + ((REAL(iy,r_sngl) - oy(io)) / ly)**2
-          IF (lz > 1.0e-6) dist = dist + ((REAL(iz,r_sngl) - oz(io)) / lz)**2
+          dist = 0.0d0
+          IF (lx > 1.0d-6) dist = dist + &
+            ((REAL(pos_km(ix,iy,iz,1),r_size) - REAL(ox(io),r_size)) / lx)**2
+          IF (ly > 1.0d-6) dist = dist + &
+            ((REAL(pos_km(ix,iy,iz,2),r_size) - REAL(oy(io),r_size)) / ly)**2
+          IF (lz > 1.0d-6) dist = dist + &
+            ((REAL(pos_km(ix,iy,iz,3),r_size) - REAL(oz(io),r_size)) / lz)**2
 
           ! Keep observation if it is strictly inside the cutoff
           IF (dist <= max_dist) THEN

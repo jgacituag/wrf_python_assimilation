@@ -97,54 +97,6 @@ def compute_hxf(xf_grid: np.ndarray,
     return hxf
 
 
-def compute_loc_weights(nx: int, ny: int, nz: int,
-                        i0: int, j0: int, k0: int,
-                        locs: np.ndarray) -> np.ndarray:
-    """
-    Compute Gaussian localization weight field centered on obs point (i0,j0,k0).
-
-    Uses a compact-support cutoff: points beyond
-        max_dist = 2 * sqrt(10/3) * max(locs[0], locs[1])
-    receive weight NaN (outside radius of influence).
-
-    Inside the cutoff:
-        rho(i,j,k) = exp(-0.5 * [((i-i0)/lx)^2 + ((j-j0)/ly)^2 + ((k-k0)/lz)^2])
-
-    Axes with locs <= 0 are ignored (no localization in that direction).
-
-    Parameters
-    ----------
-    nx, ny, nz : domain dimensions
-    i0, j0, k0 : obs grid location (0-based)
-    locs       : (3,) array [lx, ly, lz] in grid-point units
-
-    Returns
-    -------
-    rloc : (nx, ny, nz) float32
-        NaN outside cutoff, Gaussian weight inside.
-    """
-    lx, ly, lz = float(locs[0]), float(locs[1]), float(locs[2])
-
-    # compact-support cutoff in grid-point units (horizontal only, as in advisor's code)
-    max_dist = 2.0 * (10.0 / 3.0) ** 0.5 * max(lx if lx > 0 else 0.0,ly if ly > 0 else 0.0,lz if lz > 0 else 0.0)
-
-    ii = np.arange(nx, dtype=np.float32)[:, np.newaxis, np.newaxis]
-    jj = np.arange(ny, dtype=np.float32)[np.newaxis, :, np.newaxis]
-    kk = np.arange(nz, dtype=np.float32)[np.newaxis, np.newaxis, :]
-
-    dist = np.zeros((nx, ny, nz), dtype=np.float32)
-    if lx > 0.0:
-        dist += ((ii - i0) / lx) ** 2
-    if ly > 0.0:
-        dist += ((jj - j0) / ly) ** 2
-    if lz > 0.0:
-        dist += ((kk - k0) / lz) ** 2
-
-    # Apply the cutoff logic using max_dist
-    rloc = np.where(dist <= max_dist, np.exp(-0.5 * dist), np.nan).astype(np.float32)
-    return rloc
-
-
 def aoei(yo: np.ndarray,
          hxf: np.ndarray,
          R0: np.ndarray) -> np.ndarray:
@@ -176,27 +128,42 @@ def aoei(yo: np.ndarray,
     return np.maximum(R0_, d**2 - sigma2_f).astype(np.float32)
 
 
-def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
+def _letkf_step(xf_grid, hxf, yo, obs_error_var,
+                ox_km, oy_km, oz_km, loc_scales_km, pos_km):
     """
-    One LETKF analysis via Fortran.  obs_error_var is R (variance).
-    Returns xa : (nx, ny, nz, Ne, nvar), float32.
+    One LETKF analysis via Fortran. Localization is km-based throughout.
+
+    Parameters
+    ----------
+    xf_grid      : (nx, ny, nz, Ne, nvar)  prior ensemble, float32
+    hxf          : (nobs, Ne)               H(xf) ensemble in obs space
+    yo           : (nobs,)                  observations
+    obs_error_var: (nobs,) or scalar        observation error variance R
+    ox_km        : (nobs,) float32          obs x-position [km]
+    oy_km        : (nobs,) float32          obs y-position [km]
+    oz_km        : (nobs,) float32          obs z-position [km]
+    loc_scales_km: (3,) float32             [lx, ly, lz] in km
+    pos_km       : (nx, ny, nz, 3) float32  grid-point positions [km]
+
+    Returns
+    -------
+    xa : (nx, ny, nz, Ne, nvar), float32
     """
     cda = _get_cda()
     nx, ny, nz, Ne, nvar = xf_grid.shape
     nobs = len(yo)
 
-    ox_f = (np.asarray(ox, np.int64) + 1).astype(np.float32)   # 1-based
-    oy_f = (np.asarray(oy, np.int64) + 1).astype(np.float32)
-    oz_f = (np.asarray(oz, np.int64) + 1).astype(np.float32)
-
+    ox_f   = np.asarray(ox_km,        np.float32)
+    oy_f   = np.asarray(oy_km,        np.float32)
+    oz_f   = np.asarray(oz_km,        np.float32)
     dep    = (yo - hxf.mean(axis=1)).astype(np.float32)
     oerr_f = np.asarray(obs_error_var, np.float32)
-    locs_f = np.asarray(loc_scales,    np.float32)
+    locs_f = np.asarray(loc_scales_km, np.float32)
 
-    _log(3, f"Running LETKF step with obs_error_var mean={oerr_f.mean():.2f} and nobs={nobs}...")
+    _log(3, f"Running LETKF step: nobs={nobs}  "
+            f"oerr_mean={oerr_f.mean():.2f}  locs={locs_f} km")
 
     t0 = time.time()
-
     xa_out, n_updated = cda.simple_letkf_wloc(
         nx=nx, ny=ny, nz=nz,
         nbv=Ne, nvar=nvar, nobs=nobs,
@@ -205,26 +172,36 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
         dep=dep,
         ox=ox_f, oy=oy_f, oz=oz_f,
         locs=locs_f, oerr=oerr_f,
+        pos_km=np.asfortranarray(pos_km),
     )
     dt = time.time() - t0
     total_pts = nx * ny * nz
     pct_skipped = ((total_pts - n_updated) / total_pts) * 100
-    
-    _log(3, f"      [Fortran LETKF] {dt:.3f}s | Updated {int(n_updated)}/{total_pts} pts (Skipped {pct_skipped:.1f}%)")
+    _log(3, f"      [Fortran LETKF] {dt:.3f}s | "
+            f"Updated {int(n_updated)}/{total_pts} pts "
+            f"(Skipped {pct_skipped:.1f}%)")
     return xa_out.astype(np.float32)
 
 
-def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
+def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz,
+                 loc_scales_km, var_idx, pos_km):
     """
     Standard LETKF: single step, no AOEI, no tempering.
 
-    Returns
-    -------
-    dict: xa, hxf, dep, obs_error
+    ox, oy, oz    : (nobs,) int   0-based grid indices
+    loc_scales_km : (3,)          [lx, ly, lz] in km
+    pos_km        : (nx,ny,nz,3)  grid-point positions [km]
+
+    Returns dict: xa, hxf, dep, obs_error
     """
     R0  = np.asarray(obs_error_var, np.float32)
     hxf = compute_hxf(xf_grid, ox, oy, oz, var_idx)
-    xa  = _letkf_step(xf_grid, hxf, yo, R0, ox, oy, oz, loc_scales)
+    idx = (np.asarray(ox, np.intp), np.asarray(oy, np.intp), np.asarray(oz, np.intp))
+    xa  = _letkf_step(xf_grid, hxf, yo, R0,
+                      pos_km[idx[0], idx[1], idx[2], 0],
+                      pos_km[idx[0], idx[1], idx[2], 1],
+                      pos_km[idx[0], idx[1], idx[2], 2],
+                      loc_scales_km, pos_km)
     return dict(
         xa=xa,
         hxf=hxf,
@@ -233,74 +210,84 @@ def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     )
 
 
-def tenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
-                 ntemp, alpha_s):
+def tenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz,
+                 loc_scales_km, var_idx, ntemp, alpha_s, pos_km):
     """
     TEnKF (LETKF-T): Ntemp sequential steps with back-loaded inflation.
 
-    At each step i: recompute H(x), inflate R -> R/alpha_i, run LETKF.
+    ox, oy, oz    : (nobs,) int   0-based grid indices
+    loc_scales_km : (3,)          [lx, ly, lz] in km
+    pos_km        : (nx,ny,nz,3)  grid-point positions [km]
 
-    Returns
-    -------
-    dict: xa, xatemp, hxfs, deps, alpha_weights, obs_error
+    Returns dict: xa, hxfs, deps, alpha_weights, obs_error
     """
     t_start = time.time()
     steps = tempering_schedule(ntemp, alpha_s)
     R0    = np.asarray(obs_error_var, np.float32)
-    nx, ny, nz, Ne, nvar = xf_grid.shape
-    nobs = len(yo)
-    Nt   = len(steps)
+    nobs  = len(yo)
+    Nt    = len(steps)
 
-    x_af = xf_grid.copy(order="F") # current forecast ensemble, updated at each step with the latest analysis 
-    hxfs = np.empty((Nt, nobs, Ne), dtype=np.float32)
-    deps = np.empty((Nt, nobs),     dtype=np.float32)
+    # Extract km positions for each observation once
+    idx   = (np.asarray(ox, np.intp), np.asarray(oy, np.intp), np.asarray(oz, np.intp))
+    ox_km = pos_km[idx[0], idx[1], idx[2], 0].astype(np.float32)
+    oy_km = pos_km[idx[0], idx[1], idx[2], 1].astype(np.float32)
+    oz_km = pos_km[idx[0], idx[1], idx[2], 2].astype(np.float32)
+
+    x_af = xf_grid.copy(order="F")
+    hxfs = np.empty((Nt, nobs, xf_grid.shape[3]), dtype=np.float32)
+    deps = np.empty((Nt, nobs),                    dtype=np.float32)
 
     _log(3, f"  [TEnKF] Starting {Nt} tempering steps (alpha_s={alpha_s:.2f})")
     for it in range(Nt):
         t_step = time.time()
-        
-        t_h = time.time()
         hxf = compute_hxf(x_af, ox, oy, oz, var_idx)
-        dt_h = time.time() - t_h
-
         dep = (yo - hxf.mean(axis=1)).astype(np.float32)
         hxfs[it] = hxf
-        deps[it] = dep
+        deps[it]  = dep
         oerr = R0 / steps[it]
 
-        _log(2, f"  [TEnKF]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  R/alpha={oerr.mean():.2f}  |dep|={np.abs(dep).mean():.3f}")
-        _log(3, f"    H(x) time: {dt_h:.3f}s")
+        _log(2, f"  [TEnKF]  step {it+1}/{Nt}  alpha={steps[it]:.4f}  "
+                f"R/alpha={oerr.mean():.2f}  |dep|={np.abs(dep).mean():.3f}")
 
-        x_af = _letkf_step(
-            x_af, hxf, yo, oerr, ox, oy, oz, loc_scales)
-        
-        _log(3, f"    Step {it+1} complete in {time.time() - t_step:.3f}s")
+        x_af = _letkf_step(x_af, hxf, yo, oerr,
+                            ox_km, oy_km, oz_km, loc_scales_km, pos_km)
 
-    _log(3, f"  [TEnKF Total] All {Nt} steps finished in {time.time() - t_start:.3f}s")         
+        _log(3, f"    Step {it+1} complete in {time.time()-t_step:.3f}s")
+
+    _log(3, f"  [TEnKF Total] {Nt} steps in {time.time()-t_start:.3f}s")
     return dict(xa=x_af, hxfs=hxfs, deps=deps,
                 alpha_weights=steps, obs_error=R0)
 
 
-def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
+def aoei_update(xf_grid, yo, obs_error_var, ox, oy, oz,
+                loc_scales_km, var_idx, pos_km):
     """
     LETKF + AOEI: inflate once from the prior, then one LETKF step.
 
-    Returns
-    -------
-    dict: xa, hxf, dep, obs_error_raw, obs_error
+    ox, oy, oz    : (nobs,) int   0-based grid indices
+    loc_scales_km : (3,)          [lx, ly, lz] in km
+    pos_km        : (nx,ny,nz,3)  grid-point positions [km]
+
+    Returns dict: xa, hxf, dep, obs_error_raw, obs_error
     """
     t_start = time.time()
     R0  = np.asarray(obs_error_var, np.float32)
-    t_h = time.time()
     hxf = compute_hxf(xf_grid, ox, oy, oz, var_idx)
-    _log(3, f"    [AOEI] H(x) calculated in {time.time() - t_h:.3f}s")
+    _log(3, f"    [AOEI] H(x) calculated in {time.time()-t_start:.3f}s")
 
-    R_t = aoei(yo, hxf, R0)
-    n_inf = int((R_t > R0).sum())
-    _log(3, f"    [AOEI] Inflated {n_inf}/{len(yo)} obs | R_tilde={R_t.mean():.2f} | R0={R0.mean():.2f}")
-    xa  = _letkf_step(xf_grid, hxf, yo, R_t, ox, oy, oz, loc_scales)
-  
-    _log(3, f"  [AOEI Total] cycle finished in {time.time() - t_start:.3f}s")
+    R_t    = aoei(yo, hxf, R0)
+    n_inf  = int((R_t > R0).sum())
+    _log(3, f"    [AOEI] Inflated {n_inf}/{len(yo)} obs | "
+            f"R_tilde={R_t.mean():.2f} | R0={R0.mean():.2f}")
+
+    idx   = (np.asarray(ox, np.intp), np.asarray(oy, np.intp), np.asarray(oz, np.intp))
+    xa    = _letkf_step(xf_grid, hxf, yo, R_t,
+                        pos_km[idx[0], idx[1], idx[2], 0],
+                        pos_km[idx[0], idx[1], idx[2], 1],
+                        pos_km[idx[0], idx[1], idx[2], 2],
+                        loc_scales_km, pos_km)
+
+    _log(3, f"  [AOEI Total] cycle finished in {time.time()-t_start:.3f}s")
     return dict(
         xa=xa,
         hxf=hxf,

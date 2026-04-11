@@ -1,175 +1,251 @@
 # configs/template.yaml
 # =====================
 # Full reference template for WRF Single-Cycle Assimilation experiments.
-# Every possible option is shown with a description.
 # Copy this file, rename it (e.g. ws1.yaml), and fill in your values.
 #
-# Runner:
-#   python src/runners/run_experiment.py --config configs/your_exp.yaml
-#   python src/runners/run_experiment.py --config configs/your_exp.yaml --workers 30
+# Usage
+# -----
+#   # Single truth member :
+#   python src/runners/run_experiment.py --config configs/exp.yaml --tm 0
 #
-# On the cluster:
-#   EXP=your_exp qsub queue_ws.sh
-
-#### metadata ##############################################################
-experiment_tag: MY_EXPERIMENT    # used in output filenames and the config copy
-
-# Verbosity level — controls what timing and progress is printed.
+#   # Parallel sweep :
+#   python src/runners/run_experiment.py --config configs/exp.yaml --tm 0 --workers 124
 #
+#   # Verbose override :
+#   python src/runners/run_experiment.py --config configs/exp.yaml --tm 0 --verbose 2
+#
+# Cluster (one job per truth member, PBS example):
+#   for tm in $(seq 0 49); do
+#     qsub -v TM=$tm queue_ws.sh
+#   done
+#
+# The runner always processes exactly one truth member per invocation.
+# Truth member is set via --tm on the command line (preferred) or
+# sweep.truth_members as a scalar fallback.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
+experiment_tag: MY_EXPERIMENT   # Used in output filenames and the config copy.
+
+# Verbosity — controls what timing and progress is printed.
 #   0  silent (errors only)
-#   1  one line per truth member: start, H(x) domain count, done + total time
-#   2  per-stage timing: H(truth), H(xf), QC filtering, DA call, save
-#      Use this when diagnosing where time is spent.
-#   3  per-step DA internals (TEnKF iterations, AOEI inflation counts)
-#      Very verbose — only for debugging a single experiment.
+#   1  one line per stage: setup done, N pts pass QC, combo running, file saved
+#   2  per-combo timing: H(x), DA call, save
+#   3  per-step DA internals: TEnKF iterations, AOEI inflation counts
 #
-# Recommendation:
-#   - Cluster production runs:  verbose: 1
-#   - Local timing diagnostics: verbose: 2
-#   - Debugging one experiment: verbose: 3
+# Recommendations:
+#   Cluster production runs : verbose: 1
+#   Local timing diagnostics: verbose: 2
+#   Debugging one combo      : verbose: 3
 verbose: 1
 
-skip_existing: False   # default — always overwrite npz file
-skip_existing: True    # resume a partial run without recomputing finished npz files
-#### paths #################################################################
+# If true, skip output files that already exist on disk.
+# Useful for resuming an interrupted run without recomputing finished points.
+skip_existing: false
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
 paths:
-  # Input: .npz produced by src/extract_3d_subset.py
-  # Must contain array "state_ensemble" of shape (nx, ny, nz, Ne_tot, nvar)
+  # Input .npz produced by src/extract_3d_subset.py.
+  # Required arrays:
+  #   state_ensemble (nx, ny, nz, Ne_tot, nvar)  float32
+  #   pos_km         (nx, ny, nz, 3)              float32
+  #     pos_km[i,j,k] = [x_km, y_km, z_km] distance in km from the
+  #     lower-left-bottom corner of the domain. x = east, y = north, z = altitude.
   prepared: /path/to/state_ensemble.npz
 
-  # Output directory. Will be created if it does not exist.
-  # A copy of this config file is written here before any results.
+  # Output directory. Created if it does not exist.
+  # A copy of this config is written here before any results.
   outdir: /path/to/output/
 
-#### state #################################################################
-state:
-  # Total number of members in the .npz (truth + prior)
-  n_members: 30
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
-  # Variable index mapping — must match how the .npz was built
-  # (see src/extract_3d_subset.py for the canonical order)
+state:
+  # Total number of members in the .npz (truth candidates + prior candidates).
+  # One member is held out as truth; the rest form the prior ensemble.
+  n_members: 60
+
+  # Variable index mapping — must match the order used in extract_3d_subset.py.
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
-#### observations ##########################################################
+# ---------------------------------------------------------------------------
+# Observations
+# ---------------------------------------------------------------------------
+
 obs:
-  # Observation error VARIANCE [dBZ²]  (NOT std — do not square this)
-  obs_error_var: 25.0    # corresponds to sigma = 5 dBZ
+  # Observation error VARIANCE [dBZ²].
+  # This is R (variance), NOT sigma (std). Do not square it again.
+  # Examples:
+  #   sigma = 2.2 dBZ  ->  obs_error_var: 5.0
+  #   sigma = 5.0 dBZ  ->  obs_error_var: 25.0
+  #
+  # This value is also used to set the noise std for synthetic observations:
+  #   sigma_noise = sqrt(obs_error_var)
+  # Noise is generated once per truth member with seed (42 + tm), applied
+  # to truth_hx to produce yo = truth_hx + N(0, sigma_noise).
+  obs_error_var: 5.0
 
-#### quality control #######################################################
+# ---------------------------------------------------------------------------
+# Quality control
+# ---------------------------------------------------------------------------
+
+# Points that fail QC are excluded from the obs set before any DA is run.
+# Set qc: null (or remove the section) to disable all filtering.
+
 qc:
-  # Skip points where the ensemble mean in obs space is below dbz_min.
-  # Physical motivation: no signal in observation space -> no correction possible.
-  filter_ensemble: true     # recommended: always true
+  # Skip points where the ensemble-max H(xf) is below dbz_min.
+  # Rationale: no signal in the ensemble -> no meaningful update possible.
+  filter_ensemble: true     
 
-  # Skip points where the truth (yo) is below dbz_min.
-  # Optional: isolates the nonlinear regime where the ensemble underestimates.
+  # Skip points where the truth H(x) (i.e. yo before noise) is below dbz_min.
+  # Rationale: isolates the nonlinear regime where ensemble underestimates.
   filter_truth: false
 
-  # How to combine filter_ensemble and filter_truth when both are true:
-  #   "and"  skip only if BOTH conditions fail  (less aggressive filtering)
-  #   "or"   skip if EITHER condition fails     (more aggressive filtering)
+  # How to combine the two filters when both are active:
+  #   and  -> skip if BOTH fail
+  #   or   -> skip if EITHER fails
   filter_mode: and
 
-  # Reflectivity threshold [dBZ] used by both filters above
-  dbz_min: 5.0
+  # Reflectivity threshold [dBZ] applied by both filters above.
+  dbz_min: 0.0
 
-#### sweep #################################################################
-# Every dimension supports three formats:
-#   scalar:              5         -> [5]
-#   explicit list:       [3, 5, 7] -> [3, 5, 7]
-#   range (inclusive):   {start: 1, stop: 10, num: 10}  -> [1,2,...,10]
+# ---------------------------------------------------------------------------
+# Sweep
+# ---------------------------------------------------------------------------
+#
+# Sweep parameters support three formats:
+#   scalar:           5           -> [5]
+#   list:             [1, 2, 3]   -> [1, 2, 3]
+#   range (linspace): {start: 1, stop: 3, num: 3}  -> [1, 2, 3]
 #
 # All combinations of (methods x ntemp x alpha_s x loc_x x loc_y x loc_z)
-# are run for every truth member and every obs set.
+# are run for every obs point. AOEI and LETKF ignore ntemp (single-step
+# methods) — they run once per (method, alpha_s, loc_x, loc_y, loc_z)
+# regardless of how many ntemp values are listed.
 
 sweep:
 
-  # Which truth members to use.
-  # "all" runs all n_members.  Or provide a scalar / list / range.
-  truth_members: all
-  # truth_members: 0
-  # truth_members: [0, 1, 2]
-  # truth_members: {start: 0, stop: 29, num: 30}
+  # Truth member index for this run. Overridden by --tm on the command line.
+  # Scalar only — the runner processes exactly one truth member per invocation.
+  truth_members: 0
 
-  # How many members to use as the prior ensemble.
-  # Default (null): use all remaining members after removing the truth member.
-  # Set to a scalar or list to study ensemble size sensitivity.
-  # Members are selected sequentially (0, 1, 2, ...) skipping the truth member.
-  # Ne is always recorded in the output filename as _Ne{N}.
-  prior_size: null         # use all remaining members  (default)
-  # prior_size: 20         # fixed prior size
-  # prior_size: [20, 30, 40, 50]              # sensitivity sweep
-  # prior_size: {start: 10, stop: 50, num: 5} # -> [10, 20, 30, 40, 50]
+  # Prior ensemble size.
+  # null: use all members except the truth member (Ne = n_members - 1).
+  # integer: use the first N members (sequential, skipping the truth member).
+  prior_size: null
+  # prior_size: 40
 
-  #### observation set ###################################################
-  # Controls how observations are constructed for each run.
+  # Stride — applied uniformly in x and y (no vertical stride).
+  # 1: every grid point (default, densest possible obs set).
+  # N: every N-th grid point in x and y, all z levels.
+  # Applied before QC: stride first, then filter.
+  stride: 1
+  # stride: 5
+
+  # -------------------------------------------------------------------------
+  # Observation mode
+  # -------------------------------------------------------------------------
+  # Three modes, each producing a different output structure:
   #
-  # mode: single
-  #   One fixed grid point as a single observation.
-  #   Use for WS-1 (Ntemp sweep) and targeted single-point tests.
+  #   single_obs
+  #     One fixed observation point, all combos.
+  #     Output: one .npz per run with metrics and optionally xa_sub / xf_sub.
   #
-  # mode: full_grid
-  #   Every QC-passing grid point is run as an INDEPENDENT single observation.
-  #   The prior xf is the same for all points (fresh each time, not sequential).
-  #   Produces one output file per (truth_member, point, combo).
-  #   Use for WS-2 (full innovation-space characterization).
+  #   sweep
+  #     Every QC-passing stride point, each assimilated independently as a
+  #     single observation. All combos per point.
+  #     Output: one .npz per truth member with all rows and metrics.
   #
-  # mode: strided
-  #   All QC-passing points on a ::stride subgrid, assimilated TOGETHER
-  #   in a single LETKF call.
-  #   Use for WS-3 / WS-4 (multiple-obs, dense network).
-  #
-  # mode: all
-  #   All QC-passing points assimilated together (stride=1).
-  #   Use for full-domain assimilation tests.
+  #   multi_obs
+  #     All QC-passing stride points assimilated together in one Fortran call
+  #     per combo. Uses OMP_NUM_THREADS threads (set in environment).
+  #     Output: one .npz per combo (xa_mean + global stats) + one shared
+  #             reference file per truth member (truth, xf_mean, yo).
 
   obs_points:
-    mode: single
-    loc: {x: 0, y: 0, z: 0}    # only for mode: single
+    mode: sweep          # single_obs | sweep | multi_obs
 
-  # obs_points:
-  #   mode: full_grid           # WS-2
+    # --- single_obs only ---
+    # Grid indices of the fixed observation point (0-based).
+    loc: {x: 84, y: 108, z: 5}
 
-  # obs_points:
-  #   mode: strided             # WS-3 / WS-4
-  #   stride: 2
+  # -------------------------------------------------------------------------
+  # DA methods
+  # -------------------------------------------------------------------------
+  # Available: TEnKF, AOEI
+  # (LETKF = TEnKF with ntemp: 1, kept for backward compatibility)
+  methods: [TEnKF]
+  # methods: [TEnKF, AOEI]
 
-  # obs_points:
-  #   mode: all                 # full domain
+  # Tempering iterations (TEnKF only; ignored by AOEI).
+  # AOEI always runs a single step regardless of this value.
+  ntemp: [1, 2, 3]
+  # ntemp: 1
+  # ntemp: {start: 1, stop: 5, num: 5}
 
-  #### DA methods ########################################################
-  methods: [LETKF, TEnKF, AOEI, ATEnKF, TAOEI]
-  # methods: [LETKF]
-
-  #### tempering iterations ##############################################
-  # Integer parameter.  {start, stop, num} uses rounded linspace values.
-  ntemp: 3
-  # ntemp: [1, 2, 3]
-  # ntemp: {start: 1, stop: 10, num: 10}   # -> [1,2,3,4,5,6,7,8,9,10]
-
-  #### tempering slope ###################################################
-  # Controls back-loading of the tempering schedule (Eq. 12).
-  # 0 = equal weights.  Recommended range: [1, 2].
+  # Tempering slope — controls back-loading of the tempering schedule.
+  # 0: equal weights (uniform inflation across steps).
+  # Larger values: more weight on later steps (stronger early inflation).
+  # Recommended range: [1.0, 2.0].
   alpha_s: 2.0
-  # alpha_s: [1.0, 2.0, 3.0]
-  # alpha_s: {start: 0.0, stop: 3.0, num: 4}
+  # alpha_s: [1.0, 2.0]
 
-  #### localization length scales [grid points] ##########################
-  # Separate values for x (west-east), y (south-north), z (vertical).
-  # Use 9999 (or null) to disable localization on an axis.
-  # R-localization: obs error inflated by exp(0.5*(d/L)^2) at distance d.
-  loc_x: 5.0
-  loc_y: 5.0
-  loc_z: 5.0
-  # loc_x: [3.0, 5.0, 7.0, 10.0]
-  # loc_z: {start: 2.0, stop: 8.0, num: 4}
-  # loc_x: null    # disables x-localization (L=9999)
+  # Localization length scales [km].
+  # R-localization: observation error inflated by 1/rho at distance d,
+  # where rho = exp(-0.5 * ((dx/lx)^2 + (dy/ly)^2 + (dz/lz)^2)).
+  # Distances and scales are in km, computed from pos_km.
+  # Points beyond 2*sqrt(10/3)*max(lx,ly,lz) km receive weight ~0 and are skipped.
+  loc_x: 10.0     # [km]  east-west
+  loc_y: 10.0     # [km]  north-south
+  loc_z: 4.0      # [km]  vertical (applies to non-uniform z levels exactly)
+  # Support also multiple localizations scales
+  # loc_x: [5.0, 10.0, 15.0]
+  # loc_z: {start: 2.0, stop: 6.0, num: 3}
 
-#### paralle Process ###########################################################
-# Handled at the command line (--workers N) or in queue_ws.sh.
-# Each truth member runs in its own process; all processes are independent.
-# Recommended: workers = min(n_truth_members, available_cores)
+# ---------------------------------------------------------------------------
+# Single-obs options (only used when obs_points.mode: single_obs)
+# ---------------------------------------------------------------------------
+
+# If true, save xf_sub, truth_sub, and xa_sub for each combo alongside
+# the metrics. Useful for plotting spatial analysis increments.
+# Warning: xa_sub is (nx_s, ny_s, nz_s, Ne, nvar) — can be large if the
+# subdomain is large relative to the localization scale.
+store_fields: false
+
+# ---------------------------------------------------------------------------
+# Subdomain cutoff factor
+# ---------------------------------------------------------------------------
+
+# The subdomain passed to Fortran extends cutoff_factor * L km around the
+# observation in each direction. Points beyond 2*sqrt(10/3)*L receive
+# rho=0 by the localization formula, so cutoff_factor=4 is always safe
+# (2*sqrt(10/3) ≈ 3.65). Increase only if you want extra margin.
+cutoff_factor: 4.0
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
 #
-# Internal threading is disabled in queue_ws.sh (OMP_NUM_THREADS=1 etc.)
-# so each worker process is truly single-threaded and the OS schedules
-# workers across cores without contention.
+# sweep mode:
+#   Sequential (default, safe on any system):
+#     python run_experiment.py --config exp.yaml --tm 0
+#
+#   Parallel (fork-based, Linux only):
+#     python run_experiment.py --config exp.yaml --tm 0 --workers 124
+#
+#   Workers share xf, ens_hx, truth_hx via copy-on-write (no physical copy).
+#   Each worker allocates ~3 * xf_sub at peak (~89 MB for a 41x41x11 subdomain).
+#   RAM limit: shared_arrays + n_workers * 89 MB << node RAM.
+#   Set OMP_NUM_THREADS=1 per worker to avoid Fortran OpenMP contention.
+#
+# multi_obs mode:
+#   Always single-process Python. Set OMP_NUM_THREADS in the environment
+#   to use multiple cores inside the Fortran LETKF call:
+#     export OMP_NUM_THREADS=120
+#     python run_experiment.py --config exp.yaml --tm 0
