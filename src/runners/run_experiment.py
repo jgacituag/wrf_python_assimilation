@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "fortran"))
 
 import da.core as core
 from da.core import tenkf_update, aoei_update
-
+from da.metrics import compute_single_obs_metrics, compute_multi_obs_metrics
 # ---------------------------------------------------------------------------
 # Module-level shared arrays
 # Set once in main before any fork. Workers read them via copy-on-write.
@@ -321,98 +321,6 @@ def _compute_rho(pos_km_sub, x0, y0, z0, lx_km, ly_km, lz_km):
     cutoff = (2.0 * np.sqrt(10.0 / 3.0)) ** 2
     return np.where(d2 <= cutoff, np.exp(-0.5 * d2), 0.0).astype(np.float32)
 
-
-# ---------------------------------------------------------------------------
-# Metric computation
-# ---------------------------------------------------------------------------
-
-_METRIC_KEYS = ("rmse_f", "rmse_a", "spread_f", "spread_a",
-                "rmse_f_w", "rmse_a_w", "spread_f_w", "spread_a_w")
-
-
-def _compute_metrics(xf_sub, xa_sub, truth_sub,
-                     ens_hx_sub, hxa_sub, truth_hx_sub, rho):
-    """
-    Compute all 8 metric arrays, each of length 9.
-
-    Parameters
-    ----------
-    xf_sub       (nx_s, ny_s, nz_s, Ne, nvar)  prior ensemble
-    xa_sub       (nx_s, ny_s, nz_s, Ne, nvar)  posterior ensemble
-    truth_sub    (nx_s, ny_s, nz_s, nvar)       truth state
-    ens_hx_sub   (nx_s, ny_s, nz_s, Ne)         H(xf) over subdomain
-    hxa_sub      (nx_s, ny_s, nz_s, Ne)         H(xa) over subdomain
-    truth_hx_sub (nx_s, ny_s, nz_s)             H(truth) over subdomain
-    rho          (nx_s, ny_s, nz_s)             localization weights, 0 outside cutoff
-
-    Returns
-    -------
-    dict keyed by _METRIC_KEYS. Each value is (9,) float32.
-    Indices 0-7: state variables in var_idx order. Index 8: reflectivity.
-
-    Unweighted: mean over all points where rho > 0.
-    Weighted:   rho-weighted mean over the same zone.
-    """
-    mask = rho > 0
-    n_in = int(mask.sum())
-
-    if n_in == 0:
-        z = np.zeros(9, np.float32)
-        return {k: z.copy() for k in _METRIC_KEYS}
-
-    rho_m = rho[mask].astype(np.float64)
-    w     = rho_m / rho_m.sum()
-
-    xf_mean = xf_sub.mean(axis=3)         # (nx_s, ny_s, nz_s, nvar)
-    xa_mean = xa_sub.mean(axis=3)
-    xf_sp   = xf_sub.std( axis=3, ddof=1)
-    xa_sp   = xa_sub.std( axis=3, ddof=1)
-
-    hxf_mean = ens_hx_sub.mean(axis=3)    # (nx_s, ny_s, nz_s)
-    hxa_mean = hxa_sub.mean(axis=3)
-    hxf_sp   = ens_hx_sub.std( axis=3, ddof=1)
-    hxa_sp   = hxa_sub.std(    axis=3, ddof=1)
-
-    nvar = xf_sub.shape[4]
-    rf  = np.empty(9, np.float32);  ra  = np.empty(9, np.float32)
-    sf  = np.empty(9, np.float32);  sa  = np.empty(9, np.float32)
-    rfw = np.empty(9, np.float32);  raw = np.empty(9, np.float32)
-    sfw = np.empty(9, np.float32);  saw = np.empty(9, np.float32)
-
-    for v in range(nvar):
-        ef  = (xf_mean[:,:,:,v] - truth_sub[:,:,:,v])[mask].astype(np.float64) ** 2
-        ea  = (xa_mean[:,:,:,v] - truth_sub[:,:,:,v])[mask].astype(np.float64) ** 2
-        sf_ = xf_sp[:,:,:,v][mask].astype(np.float64)
-        sa_ = xa_sp[:,:,:,v][mask].astype(np.float64)
-
-        rf[v]  = np.sqrt(ef.mean())
-        ra[v]  = np.sqrt(ea.mean())
-        sf[v]  = sf_.mean()
-        sa[v]  = sa_.mean()
-        rfw[v] = np.sqrt((w * ef).sum())
-        raw[v] = np.sqrt((w * ea).sum())
-        sfw[v] = (w * sf_).sum()
-        saw[v] = (w * sa_).sum()
-
-    # reflectivity (index 8)
-    ef_r = (hxf_mean - truth_hx_sub)[mask].astype(np.float64) ** 2
-    ea_r = (hxa_mean - truth_hx_sub)[mask].astype(np.float64) ** 2
-    sf_r = hxf_sp[mask].astype(np.float64)
-    sa_r = hxa_sp[mask].astype(np.float64)
-
-    rf[8]  = np.sqrt(ef_r.mean())
-    ra[8]  = np.sqrt(ea_r.mean())
-    sf[8]  = sf_r.mean()
-    sa[8]  = sa_r.mean()
-    rfw[8] = np.sqrt((w * ef_r).sum())
-    raw[8] = np.sqrt((w * ea_r).sum())
-    sfw[8] = (w * sf_r).sum()
-    saw[8] = (w * sa_r).sum()
-
-    return dict(rmse_f=rf, rmse_a=ra, spread_f=sf, spread_a=sa,
-                rmse_f_w=rfw, rmse_a_w=raw, spread_f_w=sfw, spread_a_w=saw)
-
-
 # ---------------------------------------------------------------------------
 # DA dispatch (subdomain, single observation)
 # ---------------------------------------------------------------------------
@@ -452,16 +360,11 @@ def _process_point(i0, j0, k0, combos, var_idx, R0_val,
                    cutoff_factor=4.0, return_fields=False):
     """
     Run all combos for one observation point.
-
-    Parameters
-    ----------
-    return_fields : bool
-        If True, also return xa_sub for each combo (used by single_obs mode).
-
+ 
     Returns
     -------
-    meta   : dict of 1-D arrays, length n_combos
-    mets   : dict of 2-D arrays, shape (n_combos, 9)
+    row    : flat dict, each key -> (n_combos,) array.
+             Contains all meta and all metrics. Ready to concatenate across points.
     fields : dict {combo_index: xa_sub} if return_fields else None
     """
     xf       = _XF
@@ -471,42 +374,50 @@ def _process_point(i0, j0, k0, combos, var_idx, R0_val,
     pos_km   = _POS_KM
     noise    = _NOISE
     nx, ny, nz, Ne, nvar = xf.shape
-
+ 
+    # variable names in index order — consistent with var_idx
+    var_names = [k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]
+ 
     x0       = float(pos_km[i0, j0, k0, 0])
     y0       = float(pos_km[i0, j0, k0, 1])
     z0       = float(pos_km[i0, j0, k0, 2])
     yo_clean = float(truth_hx[i0, j0, k0])
     yo       = float(yo_clean + noise[i0, j0, k0])
-    hxf_pt   = float(ens_hx[i0, j0, k0, :].mean())
-
-    n_c  = len(combos)
-    meta = dict(
-        i        = np.empty(n_c, np.int32),
-        j        = np.empty(n_c, np.int32),
-        k        = np.empty(n_c, np.int32),
+ 
+    n_c = len(combos)
+ 
+    # fixed meta — same for every combo at this point
+    fixed_meta = dict(
+        i        = np.full(n_c, i0,       np.int32),
+        j        = np.full(n_c, j0,       np.int32),
+        k        = np.full(n_c, k0,       np.int32),
         x_km     = np.full(n_c, x0,       np.float32),
         y_km     = np.full(n_c, y0,       np.float32),
         z_km     = np.full(n_c, z0,       np.float32),
-        method   = np.empty(n_c, dtype="U8"),
-        ntemp    = np.empty(n_c, np.int32),
-        alpha_s  = np.empty(n_c, np.float32),
-        lx_km    = np.empty(n_c, np.float32),
-        ly_km    = np.empty(n_c, np.float32),
-        lz_km    = np.empty(n_c, np.float32),
         yo       = np.full(n_c, yo,       np.float32),
         yo_clean = np.full(n_c, yo_clean, np.float32),
-        hxf_mean = np.full(n_c, hxf_pt,  np.float32),
-        hxa_mean = np.empty(n_c, np.float32),
-        dep_b    = np.full(n_c, yo - hxf_pt, np.float32),
-        dep_a    = np.empty(n_c, np.float32),
     )
-    mets   = {k: np.empty((n_c, 9), np.float32) for k in _METRIC_KEYS}
-    fields = {} if return_fields else None
-
-    # Cache subdomain arrays by loc scales to avoid reslicing for same-scale combos
-    sub_cache = {}
-
+ 
+    # combo-varying meta
+    method_arr  = np.empty(n_c, dtype="U8")
+    ntemp_arr   = np.empty(n_c, np.int32)
+    alpha_s_arr = np.empty(n_c, np.float32)
+    lx_arr      = np.empty(n_c, np.float32)
+    ly_arr      = np.empty(n_c, np.float32)
+    lz_arr      = np.empty(n_c, np.float32)
+ 
+    metrics_rows = [None] * n_c
+    fields       = {} if return_fields else None
+    sub_cache    = {}
+ 
     for c, (method, ntemp, alpha_s, lx_km, ly_km, lz_km) in enumerate(combos):
+        method_arr[c]  = method
+        ntemp_arr[c]   = ntemp
+        alpha_s_arr[c] = alpha_s
+        lx_arr[c]      = lx_km
+        ly_arr[c]      = ly_km
+        lz_arr[c]      = lz_km
+ 
         loc_key = (lx_km, ly_km, lz_km)
         if loc_key not in sub_cache:
             si, sj, sk = _subdomain_slices(
@@ -521,41 +432,43 @@ def _process_point(i0, j0, k0, combos, var_idx, R0_val,
             oz_s = k0 - sk.start
             rho  = _compute_rho(pos_km_sub, x0, y0, z0, lx_km, ly_km, lz_km)
             sub_cache[loc_key] = (xf_sub, ens_hx_sub, truth_sub, truth_hx_sub,
-                                  pos_km_sub, ox_s, oy_s, oz_s, rho, si, sj, sk)
+                                  pos_km_sub, ox_s, oy_s, oz_s, rho)
         (xf_sub, ens_hx_sub, truth_sub, truth_hx_sub,
-         pos_km_sub, ox_s, oy_s, oz_s, rho, si, sj, sk) = sub_cache[loc_key]
-
-        # assimilation — pos_km_sub and km scales passed directly
-        xa_sub = _da_subdomain(xf_sub, yo, R0_val, ox_s, oy_s, oz_s,
-                               pos_km_sub, (lx_km, ly_km, lz_km),
-                               var_idx, method, ntemp, alpha_s)
-
-        # H(xa) over subdomain — needed for reflectivity metrics
-        hxa_sub     = _calc_hx_domain(xa_sub, var_idx)   # (nx_s, ny_s, nz_s, Ne)
-        hxa_mean_pt = float(hxa_sub[ox_s, oy_s, oz_s, :].mean())
-
-        # metrics
-        m = _compute_metrics(xf_sub, xa_sub, truth_sub,
-                             ens_hx_sub, hxa_sub, truth_hx_sub, rho)
-
-        meta["i"][c]        = i0
-        meta["j"][c]        = j0
-        meta["k"][c]        = k0
-        meta["method"][c]   = method
-        meta["ntemp"][c]    = ntemp
-        meta["alpha_s"][c]  = alpha_s
-        meta["lx_km"][c]    = lx_km
-        meta["ly_km"][c]    = ly_km
-        meta["lz_km"][c]    = lz_km
-        meta["hxa_mean"][c] = hxa_mean_pt
-        meta["dep_a"][c]    = yo - hxa_mean_pt
-        for mk in _METRIC_KEYS:
-            mets[mk][c] = m[mk]
-
+         pos_km_sub, ox_s, oy_s, oz_s, rho) = sub_cache[loc_key]
+ 
+        xa_sub  = _da_subdomain(xf_sub, yo, R0_val, ox_s, oy_s, oz_s,
+                                pos_km_sub, (lx_km, ly_km, lz_km),
+                                var_idx, method, ntemp, alpha_s)
+        hxa_sub = _calc_hx_domain(xa_sub, var_idx)   # (nx_s, ny_s, nz_s, Ne)
+ 
+        metrics_rows[c] = compute_single_obs_metrics(
+            xf_sub, xa_sub, truth_sub,
+            ens_hx_sub, hxa_sub, truth_hx_sub,
+            rho, ox_s, oy_s, oz_s, yo, var_names)
+ 
         if return_fields:
             fields[c] = xa_sub
+ 
+    # assemble flat output dict — each key -> (n_combos,) array
+    combo_meta = dict(
+        method  = method_arr,
+        ntemp   = ntemp_arr,
+        alpha_s = alpha_s_arr,
+        lx_km   = lx_arr,
+        ly_km   = ly_arr,
+        lz_km   = lz_arr,
+    )
+ 
+    # stack metric scalars: metrics_rows[c] is a flat dict of floats
+    metric_keys = list(metrics_rows[0].keys())
+    metrics_flat = {
+        k: np.array([metrics_rows[c][k] for c in range(n_c)], dtype=np.float32)
+        for k in metric_keys
+    }
+ 
+    row = {**fixed_meta, **combo_meta, **metrics_flat}
+    return row, fields
 
-    return meta, mets, fields
 
 
 # ---------------------------------------------------------------------------
@@ -569,13 +482,12 @@ def _run_sweep_sequential(pts, combos, cfg, outdir, tag, tm, Ne):
     cutoff  = float(cfg.get("cutoff_factor", 4.0))
     n_pts   = len(pts)
     n_c     = len(combos)
-
+ 
     core._log(1, f"[sweep tm={tm:02d}] {n_pts} pts x {n_c} combos = {n_pts*n_c} rows")
-
-    all_meta = []
-    all_mets = []
+ 
+    all_rows = []
     t0 = time.time()
-
+ 
     for p_idx, (i0, j0, k0) in enumerate(pts):
         if p_idx % 500 == 0:
             elapsed = time.time() - t0
@@ -583,25 +495,19 @@ def _run_sweep_sequential(pts, combos, cfg, outdir, tag, tm, Ne):
             eta     = (n_pts - p_idx) / rate if rate > 0 else 0.0
             core._log(1, f"  [sweep] pt {p_idx}/{n_pts}  "
                          f"{rate:.1f} pts/s  ETA {eta/60:.0f} min")
-
-        meta, mets, _ = _process_point(
-            i0, j0, k0, combos, var_idx, R0_val, cutoff)
-        all_meta.append(meta)
-        all_mets.append(mets)
-
-    merged_meta = {k: np.concatenate([m[k] for m in all_meta]) for k in all_meta[0]}
-    merged_mets = {k: np.vstack([m[k]     for m in all_mets])  for k in all_mets[0]}
-
+        row, _ = _process_point(i0, j0, k0, combos, var_idx, R0_val, cutoff)
+        all_rows.append(row)
+ 
+    merged = {k: np.concatenate([r[k] for r in all_rows]) for k in all_rows[0]}
+    var_names = [k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]
+ 
     fname = f"{tag}_sweep_Ne{Ne:03d}_tm{tm:02d}.npz"
     out   = os.path.join(outdir, fname)
-    np.savez_compressed(out,
-        var_names = np.array(list(var_idx.keys()) + ["ref"]),
-        **merged_meta,
-        **merged_mets,
-    )
+    np.savez_compressed(out, var_names=np.array(var_names + ["ref"]), **merged)
     sz = os.path.getsize(out) / 1e6
     core._log(1, f"[sweep tm={tm:02d}] saved {n_pts*n_c} rows  "
                  f"{sz:.1f} MB  {time.time()-t0:.1f}s -> {fname}")
+
     
 def _worker_init():
     """
@@ -625,24 +531,20 @@ def _worker_init():
 
 def _sweep_worker(args):
     """Worker for parallel sweep: process a chunk of points, return merged rows."""
-    # Restrict OMP threads inside each worker to avoid Fortran thread contention
-    # between simultaneously running workers. Must be done before any Fortran call.
-    import os
-    os.environ["OMP_NUM_THREADS"]    = "1"
-    os.environ["MKL_NUM_THREADS"]    = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
+    import os as _os
+    _os.environ["OMP_NUM_THREADS"]     = "1"
+    _os.environ["MKL_NUM_THREADS"]     = "1"
+    _os.environ["OPENBLAS_NUM_THREADS"] = "1"
+ 
     pts_chunk, combos, var_idx, R0_val, cutoff = args
-    chunk_meta = []
-    chunk_mets = []
+    all_rows = []
     for (i0, j0, k0) in pts_chunk:
-        meta, mets, _ = _process_point(
-            i0, j0, k0, combos, var_idx, R0_val, cutoff)
-        chunk_meta.append(meta)
-        chunk_mets.append(mets)
-    merged_meta = {k: np.concatenate([m[k] for m in chunk_meta]) for k in chunk_meta[0]}
-    merged_mets = {k: np.vstack([m[k]     for m in chunk_mets])  for k in chunk_mets[0]}
-    return merged_meta, merged_mets
+        row, _ = _process_point(i0, j0, k0, combos, var_idx, R0_val, cutoff)
+        all_rows.append(row)
+    merged = {k: np.concatenate([r[k] for r in all_rows]) for k in all_rows[0]}
+    return merged
+ 
+
 
 
 def _run_sweep_parallel(pts, combos, cfg, outdir, tag, tm, Ne, n_workers):
@@ -670,36 +572,31 @@ def _run_sweep_parallel(pts, combos, cfg, outdir, tag, tm, Ne, n_workers):
     worker_args = [(c, combos, var_idx, R0_val, cutoff) for c in chunks]
     n_chunks    = len(chunks)
 
-    all_meta = []
-    all_mets = []
+    all_rows = []
     t0       = time.time()
-
+ 
     with Pool(processes=n_workers, initializer=_worker_init) as pool:
-        for done, (chunk_meta, chunk_mets) in enumerate(
+        for done, merged_chunk in enumerate(
                 pool.imap_unordered(_sweep_worker, worker_args), start=1):
-            all_meta.append(chunk_meta)
-            all_mets.append(chunk_mets)
-            elapsed  = time.time() - t0
-            rows_done = sum(len(m["i"]) for m in all_meta)
+            all_rows.append(merged_chunk)
+            elapsed   = time.time() - t0
+            rows_done = sum(len(r["i"]) for r in all_rows)
             rate      = rows_done / n_c / elapsed if elapsed > 0 else 0.0
             eta       = (n_pts - rows_done // n_c) / rate if rate > 0 else 0.0
             core._log(1, f"  [sweep] chunk {done}/{n_chunks}  "
                          f"pt {rows_done//n_c}/{n_pts}  "
                          f"{rate:.1f} pts/s  ETA {eta/60:.0f} min")
-
-    merged_meta = {k: np.concatenate([m[k] for m in all_meta]) for k in all_meta[0]}
-    merged_mets = {k: np.vstack([m[k]     for m in all_mets])  for k in all_mets[0]}
-
+ 
+    merged    = {k: np.concatenate([r[k] for r in all_rows]) for k in all_rows[0]}
+    var_names = [k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]
+ 
     fname = f"{tag}_sweep_Ne{Ne:03d}_tm{tm:02d}.npz"
     out   = os.path.join(outdir, fname)
-    np.savez_compressed(out,
-        var_names = np.array(list(var_idx.keys()) + ["ref"]),
-        **merged_meta,
-        **merged_mets,
-    )
+    np.savez_compressed(out, var_names=np.array(var_names + ["ref"]), **merged)
     sz = os.path.getsize(out) / 1e6
     core._log(1, f"[sweep tm={tm:02d}] saved {n_pts*n_c} rows  "
                  f"{sz:.1f} MB  {time.time()-t0:.1f}s -> {fname}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -722,18 +619,17 @@ def _run_single_obs(combos, cfg, outdir, tag, tm, Ne):
 
     core._log(1, f"[single_obs tm={tm:02d}] obs=({i0},{j0},{k0})  {len(combos)} combos")
 
-    meta, mets, _ = _process_point(
+    row, _ = _process_point(
         i0, j0, k0, combos, var_idx, R0_val, cutoff,
         return_fields=False)
-
+ 
+    var_names = [k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]
     fname = f"{tag}_single_obs_{i0}_{j0}_{k0}_Ne{Ne:03d}_tm{tm:02d}.npz"
     out   = os.path.join(outdir, fname)
-    np.savez_compressed(out,
-        var_names = np.array(list(var_idx.keys()) + ["ref"]),
-        **meta, **mets,
-    )
+    np.savez_compressed(out, var_names=np.array(var_names + ["ref"]), **row)
     sz = os.path.getsize(out) / 1e6
     core._log(1, f"[single_obs tm={tm:02d}] saved  {sz:.1f} MB -> {fname}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -819,50 +715,38 @@ def _run_multi_obs(pts, combos, cfg, outdir, tag, tm, Ne):
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        xa = res["xa"]   # (nx,ny,nz,Ne,nvar)
-
-        if store_fields:
-            # Full ensemble — for cross-section plots and spread maps.
-            # xa: ~9 GB uncompressed per combo. Use for selected cases only.
-            np.savez_compressed(out,
-                xa            = xa,
-                xf            = xf,
-                method        = method,
-                ntemp         = np.int32(ntemp),
-                alpha_s       = np.float32(alpha_s),
-                lx_km         = np.float32(lx_km),
-                ly_km         = np.float32(ly_km),
-                lz_km         = np.float32(lz_km),
-                Ne            = np.int32(Ne),
-                truth_member  = np.int32(tm),
-                var_names     = np.array(list(var_idx.keys())),
-                ref_file      = ref_fname,
-            )
-        else:
-            # Ensemble means + global summary stats — compact, for all combos.
-            xa_mean = xa.mean(axis=3).astype(np.float32)
-            rmse_g  = np.sqrt(
-                ((xa_mean - truth) ** 2).mean(axis=(0, 1, 2))).astype(np.float32)
-            sprd_g  = xa.std(axis=3, ddof=1).mean(axis=(0, 1, 2)).astype(np.float32)
-            np.savez_compressed(out,
-                xa_mean       = xa_mean,
-                rmse_global   = rmse_g,
-                spread_global = sprd_g,
-                method        = method,
-                ntemp         = np.int32(ntemp),
-                alpha_s       = np.float32(alpha_s),
-                lx_km         = np.float32(lx_km),
-                ly_km         = np.float32(ly_km),
-                lz_km         = np.float32(lz_km),
-                Ne            = np.int32(Ne),
-                truth_member  = np.int32(tm),
-                var_names     = np.array(list(var_idx.keys())),
-                ref_file      = ref_fname,
-            )
-
+        xa = res["xa"]   # (nx, ny, nz, Ne, nvar)
+ 
+        # H(xa_mean) field — precompute for metrics (single-member path of _calc_hx_domain)
+        hxa_mean_field = _calc_hx_domain(xa.mean(axis=3), var_idx)  # (nx, ny, nz)
+        hxf_mean_field = _ENS_HX.mean(axis=3)                        # (nx, ny, nz)
+        truth_hx_field = _TRUTH_HX                                    # (nx, ny, nz)
+ 
+        var_names = [k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]
+ 
+        m = compute_multi_obs_metrics(
+            xa, xf, truth,
+            hxf_mean_field, hxa_mean_field, truth_hx_field,
+            var_names, store_fields=store_fields)
+ 
+        np.savez_compressed(out,
+            method       = method,
+            ntemp        = np.int32(ntemp),
+            alpha_s      = np.float32(alpha_s),
+            lx_km        = np.float32(lx_km),
+            ly_km        = np.float32(ly_km),
+            lz_km        = np.float32(lz_km),
+            Ne           = np.int32(Ne),
+            truth_member = np.int32(tm),
+            var_names    = np.array(var_names),
+            ref_file     = ref_fname,
+            **m,
+        )
+ 
         del xa
         sz = os.path.getsize(out) / 1e6
         core._log(1, f"  saved {sz:.0f} MB  {time.time()-t1:.1f}s -> {fname}")
+
 
 
 # ---------------------------------------------------------------------------
