@@ -1,98 +1,106 @@
 #!/bin/bash
 #PBS -N WS_DA
-#PBS -l nodes=1:ppn=124
+#PBS -l nodes=1:ppn=48
+#PBS -o /tmp/ws_da_pbs_dummy.log
 #PBS -j oe
-#PBS -o /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/logs/ws_da.log
 #PBS -V
 
 # ---------------------------------------------------------------------------
-# queue_ws.sh — WRF Single-Cycle Assimilation job script
+# queue_ws.sh -- WRF Single-Cycle Assimilation job script
 #
-# Handles two modes automatically (read from config):
+# For sweep and single_obs modes ONLY.
+# Use queue_multiobs.sh for multi_obs experiments.
 #
-#   sweep     : Python multiprocessing, one worker per core.
-#               OMP_NUM_THREADS=1 to avoid Fortran thread contention.
+# One job = one truth member = one node.
+# Workers are set automatically from available cores minus 2 for OS/IO.
+# OMP_NUM_THREADS is free during setup (H(xf) uses all cores), then
+# reset to 1 inside each worker via ctypes after fork.
 #
-#   multi_obs : Single Python process, Fortran uses all OMP threads.
-#               OMP_NUM_THREADS set to N_CORES below.
+# Submit one truth member:
+#   qsub -v CONFIG=configs/ws1.yaml,TM=0 src/queue_ws.sh
 #
-# Submit:
-#   qsub src/queue_ws.sh -v CONFIG=configs/ws1.yaml,TM=0
-#   qsub src/queue_ws.sh -v CONFIG=configs/ws1.yaml,TM=0,WORKERS=8
+# Submit all truth members:
+#   for tm in $(seq 0 59); do
+#       qsub -v CONFIG=configs/ws1.yaml,TM=$tm src/queue_ws.sh
+#   done
 #
-# Variables (all optional, have defaults):
-#   CONFIG   path to yaml config  (default: configs/ws1.yaml)
-#   TM       truth member index   (default: read from config)
-#   WORKERS  parallel workers for sweep mode  (default: N_CORES)
+# Optional overrides via -v:
+#   CONFIG   path to yaml config     (default: configs/ws1.yaml)
+#   TM       truth member index      (required)
+#   WORKERS  override worker count   (default: N_CORES - 2)
 # ---------------------------------------------------------------------------
 
-set -euo pipefail
-
-# --- paths ------------------------------------------------------------------
-REPO=/home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation
+REPO=/nfsmounts/storage/scratch/jorge.gacitua/WRF_Single_Cycle_Assimilation
 LOG_DIR=$REPO/logs
 mkdir -p "$LOG_DIR"
-
 cd "$REPO"
 
 # --- environment ------------------------------------------------------------
 source /opt/load-libs.sh 3
-source /home/jorge.gacitua/miniconda3/etc/profile.d/conda.sh
+source /nfsmounts/storage/scratch/jorge.gacitua/miniconda3/etc/profile.d/conda.sh
 conda activate intermediate_exp
 
-#echo "Building Fortran library on compute node: $(hostname)"
+# --- build Fortran if needed ------------------------------------------------
 bash src/build_fortran.sh
 if [ $? -ne 0 ]; then
-    echo "ERROR: Fortran build failed on the compute node!"
+    echo "ERROR: Fortran build failed on $(hostname)"
     exit 1
 fi
-echo "Fortran build successful."
+echo "Fortran build OK"
+
 # --- parameters -------------------------------------------------------------
 CONFIG=${CONFIG:-configs/ws1.yaml}
-N_CORES=124
 
-# Read mode from config to decide threading strategy
-MODE=$(python3 -c "
-import yaml
-with open('$CONFIG') as f: cfg = yaml.safe_load(f)
-obs = cfg['sweep']['obs_points']
-print(obs if isinstance(obs, str) else obs.get('mode','sweep'))
-")
+# Detect available cores from PBS or fallback to nproc
+if [ -n "${PBS_NP:-}" ]; then
+    N_CORES=$PBS_NP
+else
+    N_CORES=$(nproc)
+fi
 
-echo "[queue] config=$CONFIG  mode=$MODE  node=$(hostname)  cores=$N_CORES"
+# Reserve 2 cores for OS/IO overhead
+SAFE_CORES=$(( N_CORES - 2 ))
+[ "$SAFE_CORES" -lt 1 ] && SAFE_CORES=1
+
+WORKERS=${WORKERS:-$SAFE_CORES}
 
 # --- threading --------------------------------------------------------------
+# OMP is left free so setup (H(xf) over full domain) uses all cores.
+# After fork, each worker resets OMP to 1 thread via ctypes (_worker_init).
+# MKL/OpenBLAS are forced to 1 to avoid nested thread contention.
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+# OMP_NUM_THREADS intentionally NOT set here — Python runner controls it
 
-if [ "$MODE" = "multi_obs" ]; then
-    # Single Python process — Fortran uses all cores via OpenMP
-    export OMP_NUM_THREADS=$N_CORES
-    WORKERS=1
-    echo "[queue] multi_obs: OMP_NUM_THREADS=$OMP_NUM_THREADS"
-else
-    # Python workers — each Fortran call is single-threaded
-    export OMP_NUM_THREADS=1
-    WORKERS=${WORKERS:-$N_CORES}
-    echo "[queue] sweep: workers=$WORKERS  OMP_NUM_THREADS=1"
-fi
+# --- logging ----------------------------------------------------------------
+# PBS cannot expand variables in #PBS -o, so we redirect manually.
+# The dummy PBS log goes to /tmp on the compute node and is discarded.
+TM=${TM:-notm}
+LOG_FILE="$LOG_DIR/ws_da_tm${TM}_W${WORKERS}_new_2.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[queue] logging to $LOG_FILE"
 
-# --- build TM argument if provided ------------------------------------------
+# --- TM argument ------------------------------------------------------------
 TM_ARG=""
-if [ -n "${TM:-}" ]; then
+if [ -n "${TM:-}" ] && [ "$TM" != "notm" ]; then
     TM_ARG="--tm $TM"
-    echo "[queue] truth member: $TM"
 fi
+
+# --- info -------------------------------------------------------------------
+echo "[queue] node=$(hostname)  cores_avail=$N_CORES  safe_cores=$SAFE_CORES"
+echo "[queue] config=$CONFIG  mode=sweep/single_obs  workers=$WORKERS  tm=${TM}"
+echo "[queue] OMP_NUM_THREADS=$(echo ${OMP_NUM_THREADS:-unset})"
 
 # --- run --------------------------------------------------------------------
 echo "[queue] starting at $(date)"
 t_start=$SECONDS
 
 python -u src/runners/run_experiment.py \
-    --config "$CONFIG" \
+    --config  "$CONFIG"  \
     --workers "$WORKERS" \
-    --verbose 1 \
+    --verbose 1          \
     $TM_ARG
 
-t_elapsed=$(( SECONDS - t_start ))
-echo "[queue] finished at $(date)  elapsed=${t_elapsed}s"
+echo "[queue] finished at $(date)  elapsed=$(( SECONDS - t_start ))s"

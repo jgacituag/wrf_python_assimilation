@@ -14,8 +14,8 @@ verbose: 1
 skip_existing: false
 
 paths:
-  prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
-  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/WS1_sweep/
+  prepared: /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
+  outdir:   /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/WS1_sweep/
 
 state:
   n_members: 60

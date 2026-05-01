@@ -602,10 +602,36 @@ def _run_sweep_sequential(pts, combos, cfg, outdir, tag, tm, Ne):
     sz = os.path.getsize(out) / 1e6
     core._log(1, f"[sweep tm={tm:02d}] saved {n_pts*n_c} rows  "
                  f"{sz:.1f} MB  {time.time()-t0:.1f}s -> {fname}")
-
+    
+def _worker_init():
+    """
+    Called once per worker process immediately after fork.
+    Forces OMP to use 1 thread regardless of how the parent initialized it.
+    Setting os.environ alone is insufficient — OMP runtime is already
+    initialized in the parent and inherited via fork.
+    """
+    import ctypes
+    omp_env = os.environ.get("OMP_NUM_THREADS", "unset")
+    try:
+        libgomp = ctypes.CDLL("libgomp.so.1")
+        libgomp.omp_set_num_threads(1)
+        core._log(1, f"[worker init pid={os.getpid()}] "
+                     f"omp_set_num_threads(1) OK  "
+                     f"OMP_NUM_THREADS_env={omp_env}")
+    except Exception as e:
+        core._log(1, f"[worker init pid={os.getpid()}] "
+                     f"WARNING: ctypes OMP reset failed: {e}  "
+                     f"OMP_NUM_THREADS_env={omp_env}")
 
 def _sweep_worker(args):
     """Worker for parallel sweep: process a chunk of points, return merged rows."""
+    # Restrict OMP threads inside each worker to avoid Fortran thread contention
+    # between simultaneously running workers. Must be done before any Fortran call.
+    import os
+    os.environ["OMP_NUM_THREADS"]    = "1"
+    os.environ["MKL_NUM_THREADS"]    = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
     pts_chunk, combos, var_idx, R0_val, cutoff = args
     chunk_meta = []
     chunk_mets = []
@@ -622,8 +648,8 @@ def _sweep_worker(args):
 def _run_sweep_parallel(pts, combos, cfg, outdir, tag, tm, Ne, n_workers):
     """
     Process stride points across n_workers processes (fork-based, Linux).
-    Workers inherit all module globals via copy-on-write; no data copying occurs
-    unless a worker writes — which they do not for the shared arrays.
+    Uses imap_unordered so results stream in as workers finish, allowing
+    live progress reporting without waiting for all workers to complete.
     """
     var_idx = cfg["state"]["var_idx"]
     R0_val  = float(cfg["obs"]["obs_error_var"])
@@ -634,16 +660,33 @@ def _run_sweep_parallel(pts, combos, cfg, outdir, tag, tm, Ne, n_workers):
     core._log(1, f"[sweep tm={tm:02d}] parallel  workers={n_workers}  "
                  f"{n_pts} pts x {n_c} combos = {n_pts*n_c} rows")
 
-    chunk_size  = math.ceil(n_pts / n_workers)
+    import os as _os
+    _os.environ["OMP_NUM_THREADS"]     = "1"
+    _os.environ["MKL_NUM_THREADS"]     = "1"
+    _os.environ["OPENBLAS_NUM_THREADS"]= "1"
+
+    chunk_size  = max(1, n_pts // n_workers)
     chunks      = [pts[i:i+chunk_size] for i in range(0, n_pts, chunk_size)]
     worker_args = [(c, combos, var_idx, R0_val, cutoff) for c in chunks]
+    n_chunks    = len(chunks)
 
-    t0 = time.time()
-    with Pool(processes=n_workers) as pool:
-        results = pool.map(_sweep_worker, worker_args)
+    all_meta = []
+    all_mets = []
+    t0       = time.time()
 
-    all_meta    = [r[0] for r in results]
-    all_mets    = [r[1] for r in results]
+    with Pool(processes=n_workers, initializer=_worker_init) as pool:
+        for done, (chunk_meta, chunk_mets) in enumerate(
+                pool.imap_unordered(_sweep_worker, worker_args), start=1):
+            all_meta.append(chunk_meta)
+            all_mets.append(chunk_mets)
+            elapsed  = time.time() - t0
+            rows_done = sum(len(m["i"]) for m in all_meta)
+            rate      = rows_done / n_c / elapsed if elapsed > 0 else 0.0
+            eta       = (n_pts - rows_done // n_c) / rate if rate > 0 else 0.0
+            core._log(1, f"  [sweep] chunk {done}/{n_chunks}  "
+                         f"pt {rows_done//n_c}/{n_pts}  "
+                         f"{rate:.1f} pts/s  ETA {eta/60:.0f} min")
+
     merged_meta = {k: np.concatenate([m[k] for m in all_meta]) for k in all_meta[0]}
     merged_mets = {k: np.vstack([m[k]     for m in all_mets])  for k in all_mets[0]}
 
@@ -867,9 +910,19 @@ def main():
 
     t_start = time.time()
 
-    # setup — always runs first, populates module globals and frees ens
+    core._log(1, f"[main] OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS','unset')} "
+                 f"before setup  pid={os.getpid()}")
+
+    if obs_mode == "sweep" and n_workers > 1:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        core._log(1, f"[main] OMP forced to 1 before setup (fork-safe)  "
+                    f"H(xf) will be single-threaded")
+
     pts, Ne = _setup(cfg, tm)
     combos  = _build_combos(cfg["sweep"])
+
+    core._log(1, f"[main] OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS','unset')} "
+                 f"after setup  pid={os.getpid()}")
     core._log(1, f"[{tag}] {len(combos)} combos  {len(pts)} obs candidates")
 
     if obs_mode == "single_obs":
@@ -879,6 +932,8 @@ def main():
         if n_workers == 1:
             _run_sweep_sequential(pts, combos, cfg, outdir, tag, tm, Ne)
         else:
+            os.environ["OMP_NUM_THREADS"] = "1"   # ADD THIS before forking
+            core._log(1, "[main] OMP_NUM_THREADS set to 1 for parallel sweep")
             _run_sweep_parallel(pts, combos, cfg, outdir, tag, tm, Ne, n_workers)
 
     elif obs_mode == "multi_obs":
