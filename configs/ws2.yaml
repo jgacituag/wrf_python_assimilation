@@ -16,19 +16,19 @@ qc:
   filter_ensemble: true 
   filter_truth:    false  
   filter_mode:     and
-  dbz_min:         5.0   
+  dbz_min:         0.0   
 
 sweep:
   truth_members: 0        # Truth is member 0
-  prior_size: 40          # 40 ensemble members
+  prior_size: 60          # 40 ensemble members
   
   obs_points:
     mode: strided         # Multi-obs strided mode
-    stride: 5             # 5 grid points
+    stride: 1             # 5 grid points
 
-  methods:  [TEnKF]       
+  methods:  [TEnKF,AOEI]       
   ntemp:    [1, 2, 3]     
   alpha_s:  2.0
-  loc_x:    5.0   
-  loc_y:    5.0   
+  loc_x:    10.0   
+  loc_y:    10.0   
   loc_z:    2.0

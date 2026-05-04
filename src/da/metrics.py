@@ -105,6 +105,7 @@ def compute_single_obs_metrics(
         rho,           # (nx_s, ny_s, nz_s)              localization weights (0 outside)
         ox_s, oy_s, oz_s,  # int, obs position within subdomain (0-based)
         yo,            # scalar, observed value (with noise)
+        yo_clean,      # scalar, observed value without noise (H(truth) at obs point)
         var_names,     # list[str], state variable names in index order
 ) -> dict:
     """
@@ -175,10 +176,20 @@ def compute_single_obs_metrics(
     hxf_spread_obs = float(ens_hx_sub[ox_s, oy_s, oz_s, :].std(ddof=1))
     hxa_mean_obs   = float(hxa_sub[ox_s, oy_s, oz_s, :].mean())
     hxa_spread_obs = float(hxa_sub[ox_s, oy_s, oz_s, :].std(ddof=1))
+    truth_hx_obs   = float(truth_hx_sub[ox_s, oy_s, oz_s])
 
-    dep_b   = float(yo) - hxf_mean_obs
-    dep_a   = float(yo) - hxa_mean_obs
-    inc_obs = hxa_mean_obs - hxf_mean_obs
+    dep_b       = float(yo) - hxf_mean_obs
+    dep_b_clean = float(yo_clean) - hxf_mean_obs   # systematic departure, no noise
+    dep_a       = float(yo) - hxa_mean_obs
+    inc_obs     = hxa_mean_obs - hxf_mean_obs
+
+    # absolute error at obs point (single point → no averaging needed)
+    err_f_obs_pt = abs(hxf_mean_obs - truth_hx_obs)
+    err_a_obs_pt = abs(hxa_mean_obs - truth_hx_obs)
+
+    # spread ratio at obs point (< 1 = spread reduction, > 1 = spread increase)
+    spread_ratio = (hxa_spread_obs / hxf_spread_obs
+                    if hxf_spread_obs > 1e-6 else np.nan)
 
     # ---- localization zone summary -----------------------------------------
     n_updated    = int(mask.sum())
@@ -202,8 +213,12 @@ def compute_single_obs_metrics(
         spread_f_obs    = hxf_spread_obs,
         spread_a_obs    = hxa_spread_obs,
         dep_b           = dep_b,
+        dep_b_clean     = dep_b_clean,
         dep_a           = dep_a,
         inc_obs         = inc_obs,
+        err_f_obs_pt    = err_f_obs_pt,
+        err_a_obs_pt    = err_a_obs_pt,
+        spread_ratio    = spread_ratio,
         # localization zone
         n_updated       = float(n_updated),   # float so npz stacking works uniformly
         loc_weights_sum = loc_wsum,

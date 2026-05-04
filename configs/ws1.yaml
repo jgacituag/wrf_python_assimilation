@@ -32,7 +32,7 @@ qc:
  
 sweep:
   truth_members: 0
-  prior_size:    40
+  prior_size:    60
  
   obs_points:
     mode: sweep

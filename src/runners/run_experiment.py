@@ -199,9 +199,9 @@ def _setup(cfg, tm):
     if prior_size is not None:
         prior_size = int(prior_size)
         if prior_size > len(all_others):
-            raise ValueError(
-                f"prior_size={prior_size} exceeds available members "
-                f"({len(all_others)}) for truth member {tm}.")
+            core._log(1, f"[setup tm={tm:02d}] WARNING: prior_size={prior_size} exceeds "
+                        f"available members ({len(all_others)}) — using all {len(all_others)}")
+            prior_size = len(all_others)
         all_others = all_others[:prior_size]
     Ne = len(all_others)
 
@@ -234,6 +234,7 @@ def _setup(cfg, tm):
         noise = np.zeros((nx, ny, nz), dtype=np.float32)
 
     core._log(2, f"[setup tm={tm:02d}] noise field ready  sigma={sigma:.3f} dBZ  seed={42+tm}")
+
 
     # --- QC-filtered stride points ---
     stride  = int(cfg["sweep"].get("stride", 1))
@@ -444,7 +445,7 @@ def _process_point(i0, j0, k0, combos, var_idx, R0_val,
         metrics_rows[c] = compute_single_obs_metrics(
             xf_sub, xa_sub, truth_sub,
             ens_hx_sub, hxa_sub, truth_hx_sub,
-            rho, ox_s, oy_s, oz_s, yo, var_names)
+            rho, ox_s, oy_s, oz_s, yo, yo_clean, var_names)
  
         if return_fields:
             fields[c] = xa_sub
